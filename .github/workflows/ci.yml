@@ -22,13 +22,23 @@ jobs:
           node-version-file: package.json
           cache: npm
 
-      - name: Install bubblewrap
+      - name: Install bubblewrap and ffmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap ffmpeg
 
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # The runner's bwrap-userns-restrict profile confines the sandbox in
+      # unpriv_bwrap, which forbids the nested sandbox of the container mode.
+      - name: Unload AppArmor profiles
+        run: sudo aa-teardown
+
+      # A guest test runs find over the visible filesystem with a 60 s limit;
+      # the runner image carries about a million files of unused SDKs.
+      - name: Remove unused SDKs of the runner image
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell /usr/local/share/chromium /opt/microsoft /opt/google /usr/lib/jvm
 
       - name: Install dependencies
         run: npm ci
