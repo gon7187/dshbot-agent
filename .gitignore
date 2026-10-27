@@ -1,0 +1,5 @@
+# Чужие репозитории: стягиваются scripts/fetch-refs.sh по refs/refs.lock
+/refs/*/
+/refs/*.log
+graphify-out/
+node_modules/

@@ -1,0 +1,5 @@
+# name             url                                              rev
+openclaw           https://github.com/openclaw/openclaw.git         80b0dce14c907c1829a15281a0e34014b9461238
+hermes-agent       https://github.com/NousResearch/hermes-agent.git df722c88648ace75510abe6e6cfceb6dcc77da69
+deepseek-harness   https://github.com/deepseek-ai/deepseek-harness.git 687f282e8625c6b8d11ff58211a90524be2e4317
+ouroboros          https://github.com/razzant/ouroboros.git         6f3ddff05ff3e6c6f8d007ff96358df6af872e83

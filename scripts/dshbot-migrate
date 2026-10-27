@@ -1,0 +1,7 @@
+#!/bin/sh
+# Move the owner's OpenClaw installation to DSHBOT: plan first, apply with --yes.
+# The tool itself is TypeScript under packages/migrate, started the same way as
+# `npm start` (the register hook resolves `./x.js` to the TypeScript source).
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec node --import "$here/../packages/app/register.mjs" -- "$here/../packages/migrate/src/cli.ts" "$@"

@@ -1,0 +1,33 @@
+# DSHBOT recovery doctor: a tiny separate process that tells the owner the main
+# daemon is down and lets the owner diagnose/restart it from Telegram.
+# Template: scripts/install.sh copies it into ~/.config/systemd/user/ and
+# replaces the mise node path with the real node binary. Existing manual installs
+# that symlink this file keep working. It is started by OnFailure= of
+# dshbot.service, never enabled on its own.
+#
+# The doctor imports no packages/app code and needs no node_modules: it runs
+# straight from the deployed application tree. It polls Telegram only while the
+# main unit is not active, and exits by itself when the main unit returns.
+# Its bash tool runs every command in bwrap: only DSHBOT_HOME and /tmp are
+# writable there, and without a working bwrap the bash tool refuses every
+# command (status and restart still work).
+
+[Unit]
+Description=DSHBOT recovery doctor (Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/dshbot/app
+EnvironmentFile=%h/.config/dshbot/dshbot.env
+Environment=DSHBOT_HOME=%h/.local/share/dshbot
+Environment=DSH_TELEMETRY_DISABLED=1
+Environment=NODE_ENV=production
+Environment=NODE_COMPILE_CACHE=%h/.local/share/dshbot/compile-cache
+ExecStart=%h/.local/share/mise/shims/node ./packages/doctor/bin/doctor.ts
+Restart=no
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=yes
+ProtectSystem=strict

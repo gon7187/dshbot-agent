@@ -1,0 +1,48 @@
+# DSHBOT daemon as a systemd user unit (template; scripts/install.sh copies it).
+# Install: scripts/install.sh. It copies this file into ~/.config/systemd/user/,
+# replaces the mise node path below with the real node binary and enables the unit.
+# Existing manual installs that symlink this file keep working: this template has
+# a runnable mise path, never a placeholder. Code runs from the `live` worktree
+# in ~/.local/share/dshbot/app, never from the development checkout.
+
+[Unit]
+Description=DSHBOT personal agent
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# A dead daemon starts the separate recovery doctor (Telegram, no Restart).
+OnFailure=dshbot-doctor.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/dshbot/app
+EnvironmentFile=%h/.config/dshbot/dshbot.env
+Environment=DSHBOT_HOME=%h/.local/share/dshbot
+Environment=DSH_TELEMETRY_DISABLED=1
+Environment=NODE_ENV=production
+Environment=NODE_COMPILE_CACHE=%h/.local/share/dshbot/compile-cache
+# Adopt an accepted candidate or roll back a crashing live before the code starts.
+ExecStartPre=/bin/bash %h/.local/share/dshbot/app/scripts/adopt.sh
+# The launcher reads DSHBOT_ISOLATION from dshbot.env: host (default) or container
+# (the whole daemon inside bwrap with fake root). It refuses to start without bwrap.
+ExecStart=%h/.local/share/dshbot/app/scripts/dshbot-run.sh %h/.local/share/mise/shims/node --import ./packages/app/register.mjs ./packages/app/src/main.ts
+Restart=on-failure
+RestartSec=5
+# Adoption and the daily sync exit with 42, /restart and a self-restart with 75:
+# both are intentional stops, so they are a successful exit and OnFailure must
+# not start the doctor. RestartForceExitStatus makes systemd restart them anyway.
+SuccessExitStatus=42 75
+RestartForceExitStatus=42 75
+# /panic exits with 77: stay down until the owner starts the unit again.
+# Exit 78 is a configuration error (missing token, malformed value): a restart
+# cannot fix it, so systemd must not burn the start limit on a restart loop.
+RestartPreventExitStatus=77 78
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=default.target
