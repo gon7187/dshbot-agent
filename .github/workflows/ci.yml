@@ -36,9 +36,13 @@ jobs:
         run: sudo aa-teardown
 
       # A guest test runs find over the visible filesystem with a 60 s limit;
-      # the runner image carries about a million files of unused SDKs.
+      # the runner image carries about a million files of unused SDKs, and a
+      # cold walk of the rest is still slower than that, so warm the cache in
+      # the background while dependencies install and the first tests run.
       - name: Remove unused SDKs of the runner image
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell /usr/local/share/chromium /opt/microsoft /opt/google /usr/lib/jvm
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell /usr/local/share/chromium /opt/microsoft /opt/google /usr/lib/jvm
+          nohup find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o -print > /dev/null 2>&1 &
 
       - name: Install dependencies
         run: npm ci
