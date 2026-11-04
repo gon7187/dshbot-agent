@@ -163,7 +163,7 @@ test('sync review identifies verified main and live separately from autonomous s
   expect(prompt).toContain(liveSha)
   expect(prompt).toContain('UPSTREAM_GATE_CODE')
   expect(prompt).toContain('UPSTREAM_SANDBOX_CODE')
-  expect(gateEvidence(prompt)).toEqual({ mainSha, liveSha, candidateSha: mainSha,
+  expect(gateEvidence(prompt)).toMatchObject({ mainSha, liveSha, candidateSha: mainSha,
     gate: { command: ['npm', 'test'], status: 0, sandbox: true, testedSha: mainSha } })
   const policy = prompt.split('## Trusted sync-review checklist')[1]?.split('## ')[0]
   expect(policy).toBeTruthy()
@@ -204,7 +204,7 @@ test('sync review refuses provenance when the gate moves the candidate off captu
   expect(git(live, 'rev-parse', 'HEAD')).toBe(liveSha)
 })
 
-function gateEvidence(prompt: string): unknown {
+function gateEvidence(prompt: string): Record<string, unknown> {
   const section = prompt.split('## Controller-verified gate evidence')[1]
   const block = section?.match(/```json\s*([\s\S]*?)```/)
   expect(block, 'controller supplies machine-readable gate proof').toBeTruthy()
@@ -270,9 +270,15 @@ test('sync reviews complete bounded executable packets and every deletion; any r
   const { evolve, reviewer } = world()
   for (const rejected of ['PACKET_A_TAIL', 'PACKET_B_TAIL', null]) {
     reviewer.mockClear()
-    reviewer.mockImplementation(async ({ prompt }) => JSON.stringify({
-      verdict: rejected !== null && prompt.includes(rejected) ? 'reject' : 'approve', summary: 'packet reviewed',
-    }))
+    const finding = 'Reviewed installer disables lifecycle scripts; preserve this verified finding across packets.'
+    let reviewedPackets = 0
+    reviewer.mockImplementation(async ({ prompt }) => {
+      const first = reviewedPackets++ === 0
+      return JSON.stringify({
+        verdict: rejected !== null && prompt.includes(rejected) ? 'reject' : 'approve',
+        summary: rejected === null && first ? finding : 'packet reviewed',
+      })
+    })
     const result = await evolve.syncMain()
     expect(result.state, `${rejected}: ${JSON.stringify(result)}`).toBe(rejected === null ? 'adopted' : 'gate-failed')
     expect(existsSync(join(home, 'adopt.json'))).toBe(rejected === null)
@@ -280,6 +286,24 @@ test('sync reviews complete bounded executable packets and every deletion; any r
     if (rejected !== null) continue
     const prompts = reviewer.mock.calls.map(([request]) => request.prompt)
     expect(prompts.length).toBeGreaterThan(1)
+    expect(prompts[0]!.includes(finding)).toBe(false)
+    expect(prompts[1]!.includes(finding), 'next packet receives previous approved finding').toBe(true)
+    const contexts = prompts.map(gateEvidence)
+    expect(contexts[0]).toMatchObject({ dependencyPreparation: { performed: false },
+      packet: { index: 1, total: prompts.length, files: expect.arrayContaining(['packages/app/src/a.ts']) } })
+    expect(contexts[1]).toMatchObject({ dependencyPreparation: { performed: false },
+      packet: { index: 2, total: prompts.length, files: expect.arrayContaining(['packages/app/src/b.ts']) } })
+    const continuity = [...prompts[1]!.matchAll(/```json\s*([\s\S]*?)```/g)]
+      .map((match) => JSON.parse(match[1]!)).find((value) => Array.isArray(value.priorApprovedPackets))
+    expect(continuity?.priorApprovedPackets).toContainEqual({ packet: 1, summary: finding })
+    for (const [index, prompt] of prompts.entries()) {
+      const global = prompt.split('\n').filter((line) => line.startsWith('{') && line.includes('\"reviewedFiles\"'))
+        .map((line) => JSON.parse(line)).find((value) => value.reviewedFiles === 4)
+      expect(global).toMatchObject({ reviewedFiles: 4, deletedFiles: 2 })
+      const files = (contexts[index]!.packet as { files: string[] }).files
+      expect(files.length).toBeLessThan(global.reviewedFiles)
+      expect(files.includes(index === 0 ? 'packages/app/src/b.ts' : 'packages/app/src/a.ts')).toBe(false)
+    }
     for (const marker of ['PACKET_A_TAIL', 'PACKET_B_TAIL', '-DELETED_PRODUCTION_BODY', '-DELETED_IMPORTABLE_TEST_BODY'])
       expect(prompts.some((prompt) => prompt.includes(marker)), marker).toBe(true)
     expect(prompts.some((prompt) => prompt.includes('PACKET_A_TAIL') && prompt.includes('PACKET_B_TAIL'))).toBe(false)
