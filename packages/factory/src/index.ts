@@ -163,6 +163,8 @@ export interface FactoryTask {
   reason?: string
   /** Files the accepted task changed, relative to the project root. */
   changedFiles: string[]
+  archived?: boolean
+  managementLog?: string
   /** Stage and round of a running execution. */
   progress?: FactoryExecutionProgress
 }
@@ -344,7 +346,11 @@ export interface Factory {
    * Throws when the project is not connected; no task is stored then.
    */
   createTask(input: FactoryTaskInput): FactoryTask
-  /** All tasks, newest first. */
+  returnTask(id: number, remark: string): FactoryTask
+  cancelTask(id: number, reason: string): FactoryTask
+  /** Archive a terminal task, retaining its result and submission mapping. */
+  deleteTask(id: number, reason: string): FactoryTask
+  /** Non-archived tasks, newest first. */
   listTasks(): FactoryTask[]
   /** One task by id, or undefined. */
   findTask(id: number): FactoryTask | undefined
@@ -427,6 +433,8 @@ const FACTORY_STEPS: readonly string[] = [
     request_id TEXT PRIMARY KEY NOT NULL,
     task_id INTEGER NOT NULL UNIQUE REFERENCES factory_tasks(id)
   )`,
+  `ALTER TABLE factory_tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE factory_tasks ADD COLUMN management_log TEXT NOT NULL DEFAULT ''`,
 ]
 
 const execFileAsync = promisify(execFile)
@@ -505,6 +513,8 @@ interface TaskRow {
   risk: string | null
   risk_reason: string | null
   remark: string | null
+  archived: number
+  management_log: string
   analysis_running: number | null
   execution_stage: string | null
   execution_round: number | null
@@ -1805,9 +1815,9 @@ export function createFactory(options: FactoryOptions): Factory {
     criteria, footprint, risk, risk_reason, remark, analysis_running, execution_stage,
     execution_round, execution_note, result_files, worktree, queued_at, result_base, result_stats,
     worktree_identity, acceptance_message_id, acceptance_chat_id, resume_remark, writer_tests,
-    writer_snapshot, worktree_base`
+    writer_snapshot, worktree_base, archived, management_log`
   const listTasksStatement = store.db.prepare(
-    `SELECT ${TASK_COLUMNS} FROM factory_tasks ORDER BY id DESC`,
+    `SELECT ${TASK_COLUMNS} FROM factory_tasks WHERE archived = 0 ORDER BY id DESC`,
   )
   const findTaskStatement = store.db.prepare(
     `SELECT ${TASK_COLUMNS} FROM factory_tasks WHERE id = ?`,
@@ -1875,7 +1885,13 @@ export function createFactory(options: FactoryOptions): Factory {
   )
   const retryResumeStatement = store.db.prepare(
     `UPDATE factory_tasks SET status = 'queued', queued_at = ?, resume_remark = ?, execution_note = ?,
-       execution_stage = 'execution', execution_round = 1 WHERE id = ?`,
+       execution_stage = 'execution', execution_round = 1, management_log = management_log || ?
+       WHERE id = ? AND status = 'awaiting_human' AND archived = 0`,
+  )
+  const managementStatement = store.db.prepare(
+    `UPDATE factory_tasks SET status = ?, archived = ?, queued_at = NULL,
+      execution_stage = NULL, execution_round = NULL, resume_remark = NULL,
+      management_log = management_log || ? WHERE id = ?`,
   )
   const countByStatusStatement = store.db.prepare(
     'SELECT COUNT(*) AS count FROM factory_tasks WHERE status IN (?, ?)',
@@ -1911,6 +1927,7 @@ export function createFactory(options: FactoryOptions): Factory {
   /** Chat and topic a task's analysis card must reach (the owner's chat). */
   const taskTargets = new Map<number, { chatId: number; threadId?: number }>()
   const analysisQueue: AnalysisJob[] = []
+  const workingTasks = new Set<number>()
   let analysisRunning = false
   let analysisSequence = 0
 
@@ -1929,6 +1946,7 @@ export function createFactory(options: FactoryOptions): Factory {
   /** Acceptance/merge queue: one task at a time, like execution. */
   const acceptanceQueue: number[] = []
   let acceptanceDrain: Promise<void> | undefined
+  const acceptingTasks = new Set<number>()
   /**
    * Identifies this daemon generation. Role session ids include it so a task
    * resumed after a restart never reopens the interrupted run's history.
@@ -2003,6 +2021,8 @@ export function createFactory(options: FactoryOptions): Factory {
       ...(row.risk_reason === null ? {} : { riskReason: row.risk_reason }),
       ...(row.execution_note === null ? {} : { reason: row.execution_note }),
       changedFiles: listOf(row.result_files),
+      ...(row.archived === 1 ? { archived: true } : {}),
+      ...(row.management_log === '' ? {} : { managementLog: row.management_log }),
       ...(stage === undefined || round === undefined ? {} : { progress: { stage, round } }),
     }
   }
@@ -2669,6 +2689,7 @@ export function createFactory(options: FactoryOptions): Factory {
     try {
       while (analysisQueue.length > 0) {
         const job = analysisQueue.shift()!
+        workingTasks.add(job.taskId)
         try {
           await runAnalysis(job)
         } catch (error) {
@@ -2679,6 +2700,8 @@ export function createFactory(options: FactoryOptions): Factory {
           } catch (sendError) {
             log(`analysis failure card failed: ${sendError instanceof Error ? sendError.message : String(sendError)}`)
           }
+        } finally {
+          workingTasks.delete(job.taskId)
         }
       }
     } finally {
@@ -2689,7 +2712,7 @@ export function createFactory(options: FactoryOptions): Factory {
 
   async function runAnalysis(job: AnalysisJob): Promise<void> {
     const row = findTaskStatement.get(job.taskId) as TaskRow | undefined
-    if (row === undefined) return
+    if (row === undefined || row.archived === 1) return
     const status = statusOf(row.status)
     if (job.remark === undefined && status !== 'incoming' && status !== 'analysis') return
     if (job.remark !== undefined && (status === 'rejected' || status === 'merged' || status === 'queued')) return
@@ -3281,7 +3304,9 @@ export function createFactory(options: FactoryOptions): Factory {
   }
 
   function enqueueAcceptance(taskId: number): Promise<void> {
-    if (!acceptanceQueue.includes(taskId)) acceptanceQueue.push(taskId)
+    if (acceptingTasks.has(taskId)) return drainAcceptance()
+    acceptingTasks.add(taskId)
+    acceptanceQueue.push(taskId)
     return drainAcceptance()
   }
 
@@ -3295,6 +3320,8 @@ export function createFactory(options: FactoryOptions): Factory {
             await performAcceptance(taskId)
           } catch (error) {
             failAcceptance(taskId, error)
+          } finally {
+            acceptingTasks.delete(taskId)
           }
         }
       } finally {
@@ -3745,6 +3772,7 @@ export function createFactory(options: FactoryOptions): Factory {
         if (row === undefined) continue
         if (row.status !== 'queued' && row.status !== 'running') continue
         setStatusStatement.run('running', taskId)
+        workingTasks.add(taskId)
         try {
           await runExecution(taskId)
         } catch (error) {
@@ -3757,6 +3785,8 @@ export function createFactory(options: FactoryOptions): Factory {
               log(`execution failure card failed: ${finishError instanceof Error ? finishError.message : String(finishError)}`)
             }
           }
+        } finally {
+          workingTasks.delete(taskId)
         }
       }
     } finally {
@@ -3779,14 +3809,17 @@ export function createFactory(options: FactoryOptions): Factory {
       return
     }
 
-    // A remark of the owner's «Вернуть» resumes the recorded worktree from
-    // round one. The committed task branch and every writer test stay, so the
-    // next round never repeats the writer or loses the previous commit.
+    // Return keeps the recorded worktree; only a completed red writer gate
+    // permits skipping the writer and restoring its protected tests.
     const resumeRemark = row.resume_remark !== null && row.resume_remark.trim() !== ''
       ? row.resume_remark
       : undefined
     const resuming = resumeRemark !== undefined && row.worktree !== null && row.worktree !== '' &&
       existsSync(row.worktree)
+    const savedWriterTests = listOf(row.writer_tests)
+    const savedWriterSnapshot = parseEntrySnapshot(row.writer_snapshot)
+    const resumeExecutor = resuming && savedWriterTests.length > 0 &&
+      savedWriterSnapshot !== undefined && savedWriterTests.every((path) => savedWriterSnapshot.has(path))
     let worktree: string
     let base: string
     let current: TaskRow
@@ -3799,9 +3832,10 @@ export function createFactory(options: FactoryOptions): Factory {
         await finishExecution(taskId, 'не удалось определить базовый коммит задачи для нового круга')
         return
       }
-      progressStatement.run('execution', 1, taskId)
+      const stage = resumeExecutor ? 'execution' : 'tests'
+      progressStatement.run(stage, 1, taskId)
       await refreshCards(taskId)
-      await showAcceptanceProgress(taskId, 'execution', 1)
+      await showAcceptanceProgress(taskId, stage, 1)
     } else {
       // Record the path together with `running` before git creates it: a restart
       // at any point after this finds the row and removes whatever was created.
@@ -3851,10 +3885,10 @@ export function createFactory(options: FactoryOptions): Factory {
 
     let writerTests: string[]
     let snapshot = new Map<string, EntryState>()
-    const capture = (): void => {
+    const capture = (persist = true): void => {
       snapshot = new Map()
       for (const path of writerTests) snapshot.set(path, entryState(join(worktree, path)))
-      saveWriterTestsStatement.run(JSON.stringify(writerTests), JSON.stringify([...snapshot]), taskId)
+      if (persist) saveWriterTestsStatement.run(JSON.stringify(writerTests), JSON.stringify([...snapshot]), taskId)
     }
     const writeTests = async (remark?: string, existing: readonly string[] = []): Promise<string[] | undefined> => {
       const before = await worktreeSnapshot(worktree)
@@ -3869,7 +3903,7 @@ export function createFactory(options: FactoryOptions): Factory {
       await finishExecution(taskId, `Тестописец изменил файлы вне своих тестов: ${violations.join(', ')}. Нужна повторная постановка задачи.`)
       return undefined
     }
-    if (resuming) {
+    if (resumeExecutor) {
       // Writer tests are already committed; they are still off-limits to the
       // executor, so the same footprint guard protects them. The saved list
       // keeps declared paths with any name; a task from before it falls back
@@ -3892,11 +3926,12 @@ export function createFactory(options: FactoryOptions): Factory {
       }
       capture()
     } else {
-      // Test writer: the gate must be red after it; one retry with a remark.
-      const tests = await writeTests()
+      // A saved snapshot proves the writer gate was red, not merely that tests were written.
+      saveWriterTestsStatement.run(null, null, taskId)
+      const tests = await writeTests(resumeRemark)
       if (tests === undefined) return
       writerTests = tests
-      capture()
+      capture(false)
     }
     const forbidden = (path: string): boolean =>
       isEngineeringPrivatePath(path) || writerTests.includes(path) ||
@@ -3923,7 +3958,7 @@ export function createFactory(options: FactoryOptions): Factory {
       if (undone.length > 0) log(`task #${taskId}: writer gate changes restored: ${undone.join(', ')}`)
       return true
     }
-    if (!resuming) {
+    if (!resumeExecutor) {
       if (!(await writerGate())) return
       if (gate.ok) {
         const tests = await writeTests(
@@ -3932,13 +3967,14 @@ export function createFactory(options: FactoryOptions): Factory {
         )
         if (tests === undefined) return
         writerTests = tests
-        capture()
+        capture(false)
         if (!(await writerGate())) return
         if (gate.ok) {
           await finishExecution(taskId, 'тесты тестописца не красные')
           return
         }
       }
+      capture()
     }
 
     let remark: string | undefined = resumeRemark
@@ -4265,9 +4301,60 @@ export function createFactory(options: FactoryOptions): Factory {
     void runProviderSignIn(state, method)
   }
 
+  function managementRow(id: number): TaskRow {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new Error('Неверный номер задачи')
+    const row = findTaskStatement.get(id) as TaskRow | undefined
+    if (row === undefined) throw new Error(`Задача #${id} не найдена`)
+    if (row.archived === 1) throw new Error(`Задача #${id} в архиве`)
+    if (row.status === 'analysis' || row.status === 'running' || workingTasks.has(id) || acceptingTasks.has(id) ||
+      analysisQueue.some((job) => job.taskId === id)) {
+      throw new Error(`Задача #${id} занята: дождитесь завершения активного этапа`)
+    }
+    return row
+  }
+
+  function managementEntry(action: string, reason: string): string {
+    if (typeof reason !== 'string' || reason.trim() === '' || reason.length > 4000) {
+      throw new Error('Замечание/причина обязательны: от 1 до 4000 символов')
+    }
+    return `${new Date().toISOString()} ${action}: ${reason.trim()}\n`
+  }
+
+  function returnTask(id: number, remark: string): FactoryTask {
+    const entry = managementEntry('return', remark)
+    const row = managementRow(id)
+    if (row.status !== 'awaiting_human') throw new Error(`Задача #${id} уже не ждёт приёмки`)
+    if (row.execution_note === 'тесты тестописца не красные') saveWriterTestsStatement.run(null, null, id)
+    retryResumeStatement.run(Date.now(), remark.trim(), remark.trim(), entry, id)
+    enqueueExecution(id)
+    const updated = findTaskStatement.get(id) as TaskRow | undefined
+    if (updated === undefined) throw new Error(`Задача #${id} не найдена`)
+    return taskOf(updated)
+  }
+
+  function finishTask(id: number, reason: string, archive: boolean): FactoryTask {
+    const entry = managementEntry(archive ? 'delete' : 'cancel', reason)
+    const row = managementRow(id)
+    if (archive && row.status !== 'merged' && row.status !== 'rejected') {
+      throw new Error(`Сначала отмените задачу #${id}; удалить можно только завершённую`)
+    }
+    if (!archive && row.status === 'merged') throw new Error('Влитую задачу отменить нельзя; можно удалить в архив')
+    managementStatement.run(archive ? row.status : 'rejected', archive ? 1 : 0, entry, id)
+    const updated = findTaskStatement.get(id) as TaskRow | undefined
+    if (updated === undefined) throw new Error(`Задача #${id} не найдена`)
+    return taskOf(updated)
+  }
+
   async function callbackScreen(callback: FactoryCallback): Promise<CallbackResult> {
     const parts = callback.data.split(':')
     const op = parts[1]
+    if (['ac', 'rv', 'ar', 'aa', 'ae', 'ay'].includes(op ?? '')) {
+      const row = findTaskStatement.get(Number(parts[2])) as TaskRow | undefined
+      if (row?.archived === 1) return { notice: 'Задача в архиве', answerOnly: true }
+      if (workingTasks.has(Number(parts[2])) || acceptingTasks.has(Number(parts[2]))) {
+        return { notice: 'Задача занята: дождитесь завершения активного этапа', answerOnly: true }
+      }
+    }
     if (op === 'h') return { screen: homeScreen() }
     if (op === 's') {
       switch (parts[2]) {
@@ -4543,6 +4630,7 @@ export function createFactory(options: FactoryOptions): Factory {
       const id = Number(parts[2])
       const row = Number.isSafeInteger(id) ? (findTaskStatement.get(id) as TaskRow | undefined) : undefined
       if (row === undefined) return { screen: tasksScreen(), notice: 'Задача не найдена' }
+      if (row.status !== 'awaiting_approval') return { notice: 'Задача уже не ждёт правки разбора', answerOnly: true }
       pending = { chatId: callback.chatId, kind: 'remark', taskId: id }
       return {
         screen: {
@@ -4555,6 +4643,9 @@ export function createFactory(options: FactoryOptions): Factory {
       const id = Number(parts[2])
       const row = Number.isSafeInteger(id) ? (findTaskStatement.get(id) as TaskRow | undefined) : undefined
       if (row === undefined) return { screen: tasksScreen(), notice: 'Задача не найдена' }
+      if (row.status !== 'incoming' || analysisQueue.some((job) => job.taskId === id)) {
+        return { notice: 'Задача уже не ждёт повторного разбора', answerOnly: true }
+      }
       const target = taskTargets.get(id) ?? { chatId: callback.chatId }
       enqueueAnalysis({ taskId: id, chatId: target.chatId, ...(target.threadId === undefined ? {} : { threadId: target.threadId }) })
       return {
@@ -4659,12 +4750,19 @@ export function createFactory(options: FactoryOptions): Factory {
         return true
       }
       if (current.kind === 'acceptance-remark') {
-        retryResumeStatement.run(Date.now(), text, text, current.taskId)
-        await showAcceptanceProgress(current.taskId, 'execution', 1)
-        enqueueExecution(current.taskId)
+        try {
+          returnTask(current.taskId, text)
+        } catch (error) {
+          await sendFormatted(api, chatId, error instanceof Error ? error.message : String(error))
+        }
         return true
       }
       if (current.kind === 'remark') {
+        const row = findTaskStatement.get(current.taskId) as TaskRow | undefined
+        if (row === undefined || row.archived === 1 || row.status !== 'awaiting_approval') {
+          await sendFormatted(api, chatId, 'Задача уже не ждёт правки разбора.')
+          return true
+        }
         const target = taskTargets.get(current.taskId) ?? { chatId }
         enqueueAnalysis({
           taskId: current.taskId,
@@ -4744,6 +4842,10 @@ export function createFactory(options: FactoryOptions): Factory {
       if (row === undefined) throw new Error('задача не найдена после создания')
       return taskOf(row)
     },
+
+    returnTask,
+    cancelTask: (id, reason) => finishTask(id, reason, false),
+    deleteTask: (id, reason) => finishTask(id, reason, true),
 
     listTasks(): FactoryTask[] {
       return tasks()

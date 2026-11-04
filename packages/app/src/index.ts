@@ -5296,12 +5296,15 @@ export async function startDshbot(config: DshbotConfig): Promise<Dshbot> {
   // --- the factory tool -------------------------------------------------------------------------
   //
   // The bot has its own factory in this process (`packages/factory`). The tool
-  // only creates tasks and reads them back; approval, acceptance and return are
-  // owner actions on the factory's own cards.
+  // creates, reads and manages tasks for the owner; approval and acceptance
+  // remain on the factory's own cards.
 
   const zavod: ZavodTools = createZavodTools({
     factory: {
       createTask: (input) => factory.createTask(input),
+      returnTask: (id, remark) => factory.returnTask(id, remark),
+      cancelTask: (id, reason) => factory.cancelTask(id, reason),
+      deleteTask: (id, reason) => factory.deleteTask(id, reason),
       listTasks: () => factory.listTasks(),
       findTask: (id) => factory.findTask(id),
       listProjects: () => factory.listProjects(),

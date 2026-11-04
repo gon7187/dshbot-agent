@@ -1003,3 +1003,34 @@ test('an empty failed result cannot publish through a stale accept callback and 
   await vi.waitFor(() => expect(task(id).status).toBe('rejected'), { timeout: WAIT })
   await vi.waitFor(() => expect(existsSync(worktree)).toBe(false), { timeout: WAIT })
 })
+
+test('return after failed writer reruns the writer and red gate in the same preserved worktree', async () => {
+  const id = await readyResult()
+  const worktree = taskWorktree(id)
+  put(join(worktree, 'writer-scratch.md'), 'keep prior work\n')
+  store.db.prepare(`UPDATE factory_tasks SET writer_tests = '[]', writer_snapshot = '[]',
+    result_files = NULL, execution_note = 'тесты тестописца не красные' WHERE id = ?`).run(id)
+  let checks = 0
+  gateResult = () => ++checks === 1
+    ? { ok: false, status: 1, output: 'red writer gate' }
+    : { ok: true, status: 0, output: 'green executor gate' }
+  const mark = turns.length
+  factory.returnTask(id, 'Write a failing behavioral test first')
+  await vi.waitFor(() => expect(turns.slice(mark).some(({ turn }) => turn.role === 'reviewer')).toBe(true), { timeout: WAIT })
+  await vi.waitFor(() => expect(task(id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(turns.slice(mark).map(({ turn }) => turn.role)).toEqual(['test_writer', 'executor', 'reviewer'])
+  expect(turns[mark]!.turn.prompt).toContain('Write a failing behavioral test first')
+  expect(checks).toBe(2)
+  expect(taskWorktree(id)).toBe(worktree)
+  expect(readFileSync(join(worktree, 'writer-scratch.md'), 'utf8')).toBe('keep prior work\n')
+})
+
+test('management refuses acceptance immediately while its asynchronous merge is active', async () => {
+  const id = await readyResult()
+  const accepting = press(`f1:ac:${id}`)
+  expect(() => factory.returnTask(id, 'retry')).toThrow(/занят/)
+  expect(() => factory.cancelTask(id, 'unused')).toThrow(/занят/)
+  expect(() => factory.deleteTask(id, 'hide')).toThrow(/занят/)
+  await accepting
+  await merged(id)
+})
