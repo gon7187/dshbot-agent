@@ -24,6 +24,7 @@ state_file="$home/evolve-state"
 adopt_file="$home/adopt.json"
 rollback_file="$home/rollback.json"
 adopt_notice_file="$home/adopt-notice.json"
+refused_file="$home/adopt-refused.json"
 window=120
 fuse=3
 
@@ -84,6 +85,36 @@ if [ -f "$adopt_file" ]; then
   fi
 fi
 
+# An adoption never drops a commit of the current live. A commit is kept when the
+# adopted sha holds a commit with the same content (`git cherry`: a synchronization
+# candidate replays the own commits of live under other shas). Otherwise live stays
+# where it is, adopt.json is consumed and the refusal is left for the daemon to
+# report to the owner: sha and title of every missing commit.
+refused=0
+if [ -n "$sha" ]; then
+  head_now="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+  if [ -n "$head_now" ]; then
+    if ! cherry="$(git cherry "$sha" "$head_now" 2>&1)"; then
+      echo "adopt.sh: cannot compare live with $sha: $cherry" >&2
+      exit 1
+    fi
+    missing=""
+    while read -r mark commit; do
+      [ "$mark" = "+" ] || continue
+      title="$(git show -s --format=%s "$commit" 2>/dev/null | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+      missing="${missing:+$missing,}{\"sha\":\"$commit\",\"title\":\"$title\"}"
+    done <<<"$cherry"
+    if [ -n "$missing" ]; then
+      refused=1
+      echo "adopt.sh: refusing to adopt $sha: it would drop commits of live $head_now" >&2
+      rm -f "$adopt_file"
+      printf '{"at":%s,"candidate":"%s","sha":"%s","live":"%s","reason":"stale: live changed after the candidate was created","missing":[%s]}\n' \
+        "$now" "$candidate" "$sha" "$head_now" "$missing" >"$refused_file" ||
+        echo "adopt.sh: cannot write $refused_file" >&2
+    fi
+  fi
+fi
+
 # A previous service start that never reached the health timer died: count it.
 # An adoption start is a planned restart and resets the fuse instead.
 if [ -n "$sha" ]; then
@@ -127,7 +158,7 @@ if [ -z "$sha" ] && [ "$count" -ge "$fuse" ] && [ -n "$stable" ]; then
   fi
 fi
 
-if [ -n "$sha" ]; then
+if [ -n "$sha" ] && [ "$refused" = 0 ]; then
   before="$(git rev-parse --verify HEAD 2>/dev/null || true)"
 
   # Dependencies of the adopted commit may differ. The running node_modules is

@@ -3,7 +3,7 @@
 // gate and the GitHub CLI boundary are doubles. No project command or network
 // request is executed. Every git assertion refers to these disposable fixtures.
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -12,7 +12,8 @@ import type { SandboxOptions, SandboxResult } from '../evolve/src/index.js'
 import { openStore, type Store } from '../store/src/index.js'
 import type { TelegramApi } from '../telegram/src/api.js'
 import { markdownToPlain } from '../telegram/src/rich/index.js'
-import { createFactory, type Factory, type FactoryRoleTurn } from './src/index.js'
+import { createFactory, type Factory, type FactoryRoleTurn, type FactoryOptions } from './src/index.js'
+import * as engineering from './src/engineering.js'
 
 const OWNER = 4242
 // Real git worktrees and commits run under the oversubscribed full suite; the
@@ -52,6 +53,15 @@ let messageId: number
 let roleScript: (turn: FactoryRoleTurn) => Promise<string>
 let activeRoles: number
 let releases: Array<() => void>
+let analysisRisk: 'low' | 'high'
+let failFinalNotice: boolean
+let onOwnMerged = vi.fn<(event: { taskId: number }) => void>()
+let commandRuntime: FactoryOptions['commandRuntime']
+let candidateGates: Array<'live' | 'candidate' | undefined>
+let gateOptions: SandboxOptions[]
+let gateCheck: (() => void) | undefined
+let gateResult: ((options: SandboxOptions) => SandboxResult) | undefined
+let analysisPrefixes: string[]
 
 function put(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true })
@@ -91,27 +101,6 @@ function buttons(call: Call): Json[] {
   return Array.isArray(rows) ? rows.flatMap((row: unknown) => Array.isArray(row) ? row.map(object) : []) : []
 }
 
-function assertCounts(body: string, file: string, added: number, removed: number): void {
-  const lines = body.split('\n')
-  const index = lines.findIndex((line) => line.includes(file))
-  expect(index, `diff has a row for ${file}`).toBeGreaterThanOrEqual(0)
-  const row = lines[index]!
-  const fields = row.split('|').map((field) => field.trim())
-  const header = lines.slice(0, index).reverse().find((line) => line.includes('|') && /добав|additions|insertions/i.test(line))
-  if (header && fields.length > 1) {
-    const labels = header.split('|')
-    const addIndex = labels.findIndex((label) => /добав|additions|insertions/i.test(label))
-    const removeIndex = labels.findIndex((label) => /удал|deletions/i.test(label))
-    if (addIndex >= 0 && removeIndex >= 0) {
-      expect(Number(fields[addIndex]?.replace(/^[+−-]/, ''))).toBe(added)
-      expect(Number(fields[removeIndex]?.replace(/^[+−-]/, ''))).toBe(removed)
-      return
-    }
-  }
-  expect(row).toMatch(new RegExp(`\\+\\s*${added}\\b|(?:добавлено|additions|insertions)\\s*:?\\s*${added}\\b|\\b${added}\\s*(?:добавлен|added)`, 'i'))
-  expect(row).toMatch(new RegExp(`[-−]\\s*${removed}\\b|(?:удалено|deletions)\\s*:?\\s*${removed}\\b|\\b${removed}\\s*(?:удал[её]н|deleted)`, 'i'))
-}
-
 function button(call: Call, label: string): string {
   const found = buttons(call).find((entry) => String(entry.text).includes(label))
   expect(found, `button «${label}» on ${text(call)}`).toBeDefined()
@@ -125,7 +114,7 @@ function sent(mark = 0): Call[] {
 }
 
 function acceptanceCards(mark = 0): Call[] {
-  return sent(mark).filter((call) => ['Принять', 'Вернуть'].every((label) =>
+  return calls.slice(mark).filter((call) => ['Принять', 'Вернуть'].every((label) =>
     buttons(call).some((entry) => String(entry.text).includes(label))))
 }
 
@@ -166,6 +155,14 @@ async function happy(turn: FactoryRoleTurn): Promise<string> {
 }
 
 function sandbox(options: SandboxOptions): SandboxResult {
+  gateCheck?.()
+  gateOptions.push(options)
+  candidateGates.push(options.modules)
+  if (gateResult !== undefined) {
+    const result = gateResult(options)
+    gates.push(result)
+    return result
+  }
   const fixed = readFileSync(join(options.candidate, SOURCE), 'utf8').includes('return 2')
   const result = fixed ? { ok: true, status: 0, output: 'ok' }
     : { ok: false, status: 1, output: 'AssertionError: actual 1 expected 2' }
@@ -176,15 +173,23 @@ function sandbox(options: SandboxOptions): SandboxResult {
 function startFactory(): Factory {
   const api: TelegramApi = {
     async call<T>(method: string, params: Json = {}): Promise<T> {
+      if (failFinalNotice && String(object(params.rich_message).markdown ?? params.text ?? '').includes('влито')) {
+        throw new Error('fixture Telegram delivery unavailable')
+      }
       const id = method.startsWith('send') ? ++messageId : Number(params.message_id ?? 0)
       calls.push({ method, params, id })
       return { message_id: id, chat: { id: params.chat_id } } as T
     },
   }
   return createFactory({
-    store, home, appRoot: join(home, 'app'), api, ownerId: () => OWNER,
+    store, home, onOwnMerged, appRoot: join(home, 'app'), api, ownerId: () => OWNER,
     catalogue: async () => [{ provider: 'fixture', id: 'model', name: 'Model' }],
     ownerHome: join(root, 'owner-home'), sandbox,
+    ...(commandRuntime === undefined ? {} : { commandRuntime }),
+    analysis: async (turn) => {
+      analysisPrefixes.push(turn.systemPrefix)
+      return JSON.stringify({ criteria: ['value() возвращает 2.'], footprint: [SOURCE], risk: analysisRisk })
+    },
     roleTurn: async (turn) => {
       const row = store.db.prepare("SELECT id, execution_round FROM factory_tasks WHERE status = 'running' ORDER BY id LIMIT 1")
         .get() as { id: number; execution_round: number | null } | undefined
@@ -197,7 +202,7 @@ function startFactory(): Factory {
   })
 }
 
-async function execute(options: { risk?: 'low' | 'high'; auto?: boolean; own?: boolean; title?: string } = {}): Promise<number> {
+async function execute(options: { risk?: 'low' | 'high'; auto?: boolean; own?: boolean; title?: string; footprint?: string[] } = {}): Promise<number> {
   store.kv.set('factory.autoaccept', options.auto === false ? '0' : '1')
   const title = options.title ?? 'Исправить значение value'
   const existing = store.db.prepare('SELECT id FROM factory_projects WHERE path = ?').get(project) as { id: number } | undefined
@@ -208,7 +213,7 @@ async function execute(options: { risk?: 'low' | 'high'; auto?: boolean; own?: b
     (title, body, status, project_id, project_name, project_path, created_at, criteria, footprint, risk)
     VALUES (?, ?, 'awaiting_approval', ?, 'widget', ?, ?, ?, ?, ?) RETURNING id`)
     .get(title, title, projectId, project, Date.now(), JSON.stringify(['value() возвращает 2.']),
-      JSON.stringify([SOURCE]), options.risk ?? 'low') as { id: number }
+      JSON.stringify(options.footprint ?? [SOURCE]), options.risk ?? 'low') as { id: number }
   await press(`f1:aa:${row.id}`)
   // Positive controls: the production execution path actually runs through a
   // red writer gate, a green executor gate and the reviewer before acceptance.
@@ -220,14 +225,15 @@ async function execute(options: { risk?: 'low' | 'high'; auto?: boolean; own?: b
 }
 
 function taskWorktree(id: number): string {
-  const path = turns.find((entry) => entry.turn.role === 'executor' && entry.taskId === id)?.turn.cwd
-  expect(path, 'executor really used a task worktree').toBeDefined()
+  const path = task(id).worktree
+  expect(path, 'task has a recorded worktree').toBeTruthy()
   return path!
 }
 
 async function merged(id: number): Promise<void> {
   await vi.waitFor(() => expect(task(id).status).toBe('merged'), { timeout: WAIT })
   await vi.waitFor(() => expect(existsSync(taskWorktree(id)), 'merged task worktree is removed').toBe(false), { timeout: WAIT })
+  await vi.waitFor(() => expect(git(project, 'for-each-ref', '--format=%(refname)', `refs/heads/factory/${id}`)).toBe(''), { timeout: WAIT })
 }
 
 function assertLocalResult(branch = 'main'): void {
@@ -256,6 +262,7 @@ function fail(stage = '', reason = 'fixture transport failure'): void {
 function installCli(): void {
   put(join(root, 'cli.jsonl'), '')
   put(join(root, 'prs.json'), '[]')
+  put(join(root, 'merge-policy.json'), JSON.stringify({ mergeCommitAllowed: true, rebaseMergeAllowed: true, squashMergeAllowed: true }))
   fail()
   put(join(bin, 'git'), `#!${process.execPath}
 const fs = require('node:fs')
@@ -306,7 +313,8 @@ const output = value => {
 }
 if (action === 'auth status') process.exit(0)
 else if (action === 'repo view') {
-  const repo = { nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' }, url: 'https://github.com/acme/widget' }
+  const repo = { nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' }, url: 'https://github.com/acme/widget',
+    ...JSON.parse(fs.readFileSync(${JSON.stringify(join(root, 'merge-policy.json'))}, 'utf8')) }
   if ((option('--jq', '-q') || '').includes('nameWithOwner')) console.log(repo.nameWithOwner)
   else output(repo)
 } else if (action === 'list') {
@@ -318,7 +326,7 @@ else if (action === 'repo view') {
 } else if (action === 'view') {
   const pr = selected()
   if (!pr) { process.stderr.write('no pull requests found\\n'); process.exit(1) }
-  output(pr)
+  output({ ...pr, headRefOid: git(${JSON.stringify(origin)}, 'rev-parse', 'refs/heads/' + pr.headRefName) })
 } else if (action === 'create') {
   const head = option('--head', '-H') || current()
   if (prs.some(pr => pr.headRefName === head && pr.state === 'OPEN')) {
@@ -333,10 +341,14 @@ else if (action === 'repo view') {
 } else if (action === 'merge') {
   const pr = selected()
   if (!pr) { process.stderr.write('no matching pull request\\n'); process.exit(1) }
+  if (fs.existsSync(${JSON.stringify(join(root, 'queued-merge'))})) process.exit(0)
+  if (fs.existsSync(${JSON.stringify(join(root, 'merge-delay'))})) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600)
+  }
   const remote = ${JSON.stringify(origin)}
   const sha = git(remote, 'rev-parse', 'refs/heads/' + pr.headRefName)
   git(remote, 'update-ref', 'refs/heads/' + pr.baseRefName, sha)
-  pr.state = 'MERGED'; save()
+  pr.state = 'MERGED'; pr.mergedAt = new Date().toISOString(); save()
 } else if (args[0] === '--version') console.log('gh version fixture')
 else { process.stderr.write('unsupported fixture gh command: ' + args.join(' ') + '\\n'); process.exit(1) }
 `)
@@ -368,6 +380,16 @@ beforeEach(async () => {
   activeRoles = 0
   releases = []
   roleScript = happy
+  analysisRisk = 'low'
+  failFinalNotice = false
+  onOwnMerged = vi.fn()
+  commandRuntime = undefined
+  candidateGates = []
+  gateOptions = []
+  gateCheck = undefined
+  gateResult = undefined
+  analysisPrefixes = []
+  vi.spyOn(engineering, 'createEngineeringGitView').mockResolvedValue(undefined)
   mkdirSync(home)
   mkdirSync(join(root, 'owner-home'))
   for (const [key, value] of Object.entries(IDENTITY)) vi.stubEnv(key, value)
@@ -388,328 +410,596 @@ beforeEach(async () => {
 afterEach(async () => {
   for (const release of releases) release()
   await vi.waitFor(() => expect(activeRoles).toBe(0), { timeout: WAIT })
-  // Execution commits and card edits finish immediately after the role returns.
   await vi.waitFor(() => expect(Number((store.db.prepare(
     "SELECT COUNT(*) AS count FROM factory_tasks WHERE status IN ('running', 'queued')",
   ).get() as { count: number }).count)).toBe(0), { timeout: WAIT })
-  await new Promise((resolve) => setTimeout(resolve, 30))
+  await vi.waitFor(() => {
+    const rows = store.db.prepare('SELECT id, status, worktree, acceptance_message_id FROM factory_tasks').all() as
+      Array<{ id: number; status: string; worktree: string | null; acceptance_message_id: number | null }>
+    for (const row of rows) {
+      if (row.status === 'merged' && !failFinalNotice) {
+        expect(calls.some((call) => text(call).includes(`#${row.id} `) && /влито/.test(text(call)))).toBe(true)
+      } else if (row.status === 'awaiting_human' && row.worktree !== null) expect(row.acceptance_message_id).not.toBeNull()
+    }
+  }, { timeout: WAIT })
   store.close()
+  vi.restoreAllMocks()
   vi.unstubAllEnvs()
   rmSync(root, { recursive: true, force: true })
 })
 
 vi.setConfig({ testTimeout: 40_000, hookTimeout: 20_000 })
 
-test('test_c1_low_risk_autoaccept_merges_cleans_up_and_sends_one_short_summary', async () => {
-  const id = await execute()
-  await merged(id)
-  assertLocalResult()
-  expect(readFileSync(join(project, SOURCE), 'utf8')).toBe(FIXED)
-  await vi.waitFor(() => expect(sent()).toHaveLength(1), { timeout: WAIT })
-  const summary = text(sent()[0]!)
-  expect(summary).toContain(`#${id}`)
-  expect(summary).toContain('Исправить значение value')
-  expect(summary).toMatch(/2\s*файл|файлов?\s*:\s*2/i)
-  expect(summary).toMatch(/локально\s+в\s+[«"']?main/i)
-  expect(summary.length, 'the autoaccept notice is short').toBeLessThan(700)
-  expect(acceptanceCards()).toHaveLength(0)
+test('autopilot is owner-only, opt-in, persistent, and runs low risk through merge with autoaccept disabled', async () => {
+  expect(store.kv.get('factory.autopilot')).not.toBe('1')
+  expect(await factory.handleCallback({ id: 'outsider', chatId: OWNER, fromId: OWNER + 1, messageId: 1, data: 'f1:ap' })).toBe(true)
+  expect(store.kv.get('factory.autopilot')).not.toBe('1')
+  await press('f1:ap')
+  expect(store.kv.get('factory.autopilot')).toBe('1')
+  store.kv.set('factory.autoaccept', '0')
+  factory = startFactory()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  // The own checkout cannot be changed while running: give it another base copy.
+  git(join(home, 'app'), 'checkout', '-q', '-b', 'live')
+  const created = factory.createTask({ text: 'Исправить значение value' })
+  for (const role of ['test_writer', 'executor', 'reviewer']) {
+    await vi.waitFor(() => expect(
+      turns.some((entry) => entry.taskId === created.id && entry.turn.role === role),
+      `${role} progress: ${JSON.stringify(task(created.id))}`,
+    ).toBe(true), { timeout: WAIT })
+  }
+  await vi.waitFor(() => {
+    const current = task(created.id)
+    expect(current.status, `autopilot completion: ${JSON.stringify(current)}`).toBe('merged')
+  }, { timeout: WAIT })
+  expect(turns.map(({ turn }) => turn.role)).toEqual(['test_writer', 'executor', 'reviewer'])
+  expect(git(join(home, 'app'), 'show', `main:${SOURCE}`)).toBe(FIXED.trim())
+  await press(`f1:aa:${created.id}`)
+  expect(task(created.id).status).toBe('merged')
+  expect(turns).toHaveLength(3)
+  expect(onOwnMerged).not.toHaveBeenCalled()
 })
 
-test.each([
-  { risk: 'high' as const, auto: true },
-  { risk: 'high' as const, auto: false },
-  { risk: 'low' as const, auto: false },
-])('test_c2_manual_acceptance_for_%j_has_one_rich_diff_card', async (options) => {
-  const base = git(project, 'rev-parse', 'main')
-  const id = await execute(options)
-  const card = await acceptanceCard()
-  expect(task(id).status).toBe('awaiting_human')
-  expect(git(project, 'rev-parse', 'main')).toBe(base)
-  expect(readFileSync(join(project, SOURCE), 'utf8')).toBe(BASE)
-  expect(sent()).toHaveLength(1)
-  expect(card.method).toBe('sendRichMessage')
-  expect(typeof object(card.params.rich_message).markdown).toBe('string')
-  const body = text(card)
-  expect(body).toContain('Исправить значение value')
-  for (const [file, added, removed] of [[SOURCE, 1, 1], [TEST, 4, 0]] as const) {
-    assertCounts(body, file, added, removed)
+test('autopilot leaves high risk analysis for the owner', async () => {
+  await press('f1:ap')
+  analysisRisk = 'high'
+  const created = factory.createTask({ text: 'Исправить значение value' })
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_approval'), { timeout: WAIT })
+  expect(turns).toHaveLength(0)
+})
+
+test.each(['fresh', 'restart'])('queued autopilot tasks after %s wait for acceptance and use the previous merged base', async (mode) => {
+  project = join(home, 'app')
+  github()
+  git(project, 'checkout', '-q', '-b', 'live')
+  put(join(project, 'live-only.md'), 'live checkout is ahead of the canonical base\n')
+  git(project, 'add', 'live-only.md')
+  git(project, 'commit', '-q', '-m', 'running checkout diverges from origin main')
+  const live = git(project, 'rev-parse', 'HEAD')
+  const canonical = git(origin, 'rev-parse', 'main')
+  put(join(root, 'merge-delay'), '')
+  const desired = () => turns.at(-1)?.turn.systemPrefix.includes('Second queued task') ? 3 : 2
+  gateResult = (options) => {
+    const ok = readFileSync(join(options.candidate, SOURCE), 'utf8').includes(`return ${desired()}`)
+    return { ok, status: ok ? 0 : 1, output: ok ? 'ok' : 'value assertion failed' }
   }
-  const total = body.split('\n').find((line) => /итого|всего|общий|размер|total/i.test(line))
-  expect(total, 'card states the total diff size').toBeDefined()
-  const lineCounts = /\+\s*5\b/.test(total!) && /[-−]\s*1\b/.test(total!)
-  const totalLines = /6\s*(?:строк|lines)|(?:строк|lines)\s*:\s*6\b/i.test(total!)
-  const bytes = /[1-9]\d*(?:[.,]\d+)?\s*(?:байт|[км]и?б|bytes?|[km]i?b)(?:\s|$|[.,)])/i.test(total!)
-  expect(lineCounts || totalLines || bytes, 'total is five added and one deleted line, six changed lines, or a nonzero byte size').toBe(true)
-  button(card, 'Принять')
-  button(card, 'Вернуть')
+  roleScript = async (turn) => {
+    const value = turn.systemPrefix.includes('Second queued task') ? 3 : 2
+    if (turn.role === 'test_writer') {
+      await write(turn, TEST, RED.replace('value(), 2', `value(), ${value}`))
+      return JSON.stringify({ tests: [TEST] })
+    }
+    if (turn.role === 'executor') {
+      await write(turn, SOURCE, `export function value() { return ${value} }\n`)
+      return 'done'
+    }
+    return happy(turn)
+  }
+  let first: { id: number }
+  let second: { id: number }
+  if (mode === 'fresh') {
+    await press('f1:ap')
+    store.kv.set('factory.autoaccept', '0')
+    first = factory.createTask({ title: 'First queued task', text: 'Return 2' })
+    second = factory.createTask({ title: 'Second queued task', text: 'Return 3' })
+  } else {
+    first = { id: await execute({ own: true, auto: false, title: 'First queued task' }) }
+    second = store.db.prepare(`INSERT INTO factory_tasks
+      (title, body, status, project_id, project_name, project_path, created_at, criteria, footprint, risk)
+      VALUES ('Second queued task', 'Return 3', 'awaiting_approval', 0, 'bot', ?, ?, ?, ?, 'low') RETURNING id`)
+      .get(project, Date.now(), JSON.stringify(['value returns 3']), JSON.stringify([SOURCE])) as { id: number }
+    store.kv.set('factory.autopilot', '1')
+    factory = startFactory()
+  }
+  await merged(first.id)
+  await merged(second.id)
+  const secondWriter = turns.find(({ turn, taskId }) => taskId === second.id && turn.role === 'test_writer')!
+  expect(turns.find(({ turn }) => turn.role === 'test_writer')!.head).toBe(canonical)
+  expect(git(project, 'rev-parse', 'HEAD')).toBe(live)
+  expect(readFileSync(join(project, SOURCE), 'utf8')).toBe(BASE)
+  expect(secondWriter.head).toBe(git(origin, 'rev-parse', `refs/heads/factory/${first.id}`))
+  expect(git(origin, 'show', `main:${SOURCE}`)).toBe('export function value() { return 3 }')
+})
+
+test('successful merge remains merged when the final Telegram edit fails', async () => {
+  const id = await readyResult()
+  const card = await acceptanceCard()
+  failFinalNotice = true
+  await click(card, 'Принять')
+  await merged(id)
+  expect(task(id).execution_note).toBeNull()
+  assertLocalResult()
+})
+
+test('autopilot resumes only a successful ready result after restart', async () => {
+  const id = await readyResult()
+  const failed = store.db.prepare(`INSERT INTO factory_tasks
+    (title, body, status, project_id, project_name, project_path, created_at, criteria, footprint, risk, execution_note)
+    VALUES ('failed', 'failed', 'awaiting_human', 0, 'widget', ?, ?, '[]', '[]', 'low', 'Гейт не пройден') RETURNING id`)
+    .get(project, Date.now()) as { id: number }
+  store.kv.set('factory.autopilot', '1')
+  factory = startFactory()
+  await merged(id)
+  expect(task(failed.id).status).toBe('awaiting_human')
+  expect(turns).toHaveLength(0)
+})
+
+test('autopilot never sends a failed gate to reviewer or advertises a ready result', async () => {
+  await press('f1:ap')
+  roleScript = async (turn) => turn.role === 'executor' ? 'No change' : happy(turn)
+  const created = factory.createTask({ text: 'Исправить значение value' })
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(turns.filter(({ turn }) => turn.role === 'reviewer')).toHaveLength(0)
+  expect(turns.filter(({ turn }) => turn.role === 'executor')).toHaveLength(3)
+  expect(task(created.id).execution_note).toContain('Гейт не пройден')
+  const card = sent().at(-1)!
+  expect(text(card)).toMatch(/остановлен|не завершен|не завершён/i)
+  expect(text(card)).not.toMatch(/без изменений относительно базы/)
+  expect(buttons(card).some((entry) => String(entry.text).includes('Принять'))).toBe(false)
+})
+
+test('acceptance refuses to rebase onto a base that changed after the gate', async () => {
+  const id = await readyResult()
+  const card = await acceptanceCard()
+  put(join(project, 'notes.md'), 'independent owner commit\n')
+  git(project, 'add', 'notes.md')
+  git(project, 'commit', '-q', '-m', 'owner change')
+  const ownerHead = git(project, 'rev-parse', 'HEAD')
+  await click(card, 'Принять')
+  await vi.waitFor(() => expect(task(id).execution_note).toMatch(/баз|повтор/i), { timeout: WAIT })
+  expect(task(id).status).toBe('awaiting_human')
+  expect(git(project, 'rev-parse', 'HEAD')).toBe(ownerHead)
   expect(existsSync(taskWorktree(id))).toBe(true)
 })
 
-test('test_c3_accept_edits_the_existing_card_to_merged_without_new_cards', async () => {
-  const id = await execute({ risk: 'high' })
-  const card = await acceptanceCard()
-  const mark = calls.length
-  await click(card, 'Принять')
-  await merged(id)
-  assertLocalResult()
-  await vi.waitFor(() => expect(text(latestCard(card))).toMatch(/влито/i), { timeout: WAIT })
-  expect(latestCard(card).params.message_id).toBe(card.id)
-  expect(buttons(latestCard(card))).toHaveLength(0)
-  expect(sent(mark), 'acceptance updates its original message').toHaveLength(0)
-})
-
-test('test_c4_return_routes_the_next_remark_to_executor_and_restarts_three_rounds_preserving_commit_and_tests', async () => {
-  let reviews = 0
-  roleScript = async (turn) => {
-    if (turn.role === 'reviewer' && ++reviews % 3 !== 0) {
-      return JSON.stringify({ verdict: 'reject', approved: false, summary: 'ещё круг', issues: ['Уточнить поведение'] })
-    }
-    return happy(turn)
-  }
-  const id = await execute({ auto: false })
-  const card = await acceptanceCard()
-  const worktree = taskWorktree(id)
-  const acceptedCommit = git(worktree, 'rev-parse', 'HEAD')
-  const firstExecutors = turns.filter(({ turn }) => turn.role === 'executor')
-  expect(firstExecutors.map((entry) => entry.round)).toEqual([1, 2, 3])
-  const remark = 'OWNER-ACCEPTANCE-REMARK: добавь пояснение для значения два'
-  let release!: () => void
-  const held = new Promise<void>((resolve) => { release = resolve })
-  releases.push(() => release())
-  roleScript = async (turn) => {
-    if (turn.role === 'executor') {
-      await held
-      await write(turn, SOURCE, `${FIXED}// owner remark addressed\n`)
-      return 'замечание исправлено'
-    }
-    if (turn.role === 'reviewer' && ++reviews % 3 !== 0) {
-      return JSON.stringify({ verdict: 'reject', approved: false, summary: 'ещё круг', issues: ['Уточнить поведение'] })
-    }
-    return happy(turn)
-  }
-  const mark = calls.length
-  await click(card, 'Вернуть')
-  expect(factory.waitingForInput(OWNER)).toBe(true)
-  expect(calls.slice(mark).some((call) => /текст|пришлите|введите|напишите|отправьте/i.test(text(call)) && /замечан/i.test(text(call)))).toBe(true)
-  expect(await factory.takeInput(OWNER, remark)).toBe(true)
-  await vi.waitFor(() => expect(turns.filter(({ turn }) => turn.role === 'executor')).toHaveLength(4), { timeout: WAIT })
-  const resumed = turns.filter(({ turn }) => turn.role === 'executor')[3]!
-  expect(resumed.turn.prompt).toContain(remark)
-  expect(resumed.turn.cwd).toBe(worktree)
-  expect(resumed.head, 'return preserves the previous factory commit').toBe(acceptedCommit)
-  expect(resumed.tests).toBe(RED)
-  expect(resumed.round).toBe(1)
-  expect(turns.filter(({ turn }) => turn.role === 'test_writer')).toHaveLength(1)
-  expect(text(latestCard(card))).toMatch(/исполнени[ея]/i)
-  expect(text(latestCard(card))).toMatch(/круг\s+1\s+из\s+3/i)
-  release()
-  await vi.waitFor(() => expect(reviews).toBe(6), { timeout: WAIT })
-  await vi.waitFor(() => expect(task(id).status).toBe('awaiting_human'), { timeout: WAIT })
-  expect(turns.filter(({ turn }) => turn.role === 'executor').slice(3).map((entry) => entry.round)).toEqual([1, 2, 3])
-  expect(git(worktree, 'rev-list', '--count', `${acceptedCommit}..HEAD`)).toBe('1')
-  expect(readFileSync(join(worktree, TEST), 'utf8')).toBe(RED)
-  await vi.waitFor(() => {
-    const ready = [...acceptanceCards(mark), latestCard(card)]
-    expect(ready.some((entry) => buttons(entry).some((key) => String(key.text).includes('Принять')))).toBe(true)
-  }, { timeout: WAIT })
-})
-
-test.each([GITHUB, 'git@github.com:acme/widget.git'])(
-  'test_c5_github_origin_%s_pushes_creates_pr_and_merges_with_rebase', async (url) => {
-    github(url)
-    const id = await execute()
-    await merged(id)
-    expect(prs()).toHaveLength(1)
-    expect(prs()[0]).toMatchObject({ headRefName: `factory/${id}`, baseRefName: 'main', state: 'MERGED' })
-    expect(cliCalls('git', 'push').some((entry) => entry.args.includes('origin') && !entry.failed)).toBe(true)
-    expect(cliCalls('gh', 'auth status').length).toBeGreaterThan(0)
-    expect(cliCalls('gh', 'create')).toHaveLength(1)
-    expect(cliCalls('gh', 'merge')).toHaveLength(1)
-    expect(cliCalls('gh', 'merge')[0]!.args).toContain('--rebase')
-    expect(git(origin, 'show', `main:${SOURCE}`)).toBe(FIXED.trim())
-    expect(git(project, 'for-each-ref', '--format=%(refname)', `refs/heads/factory/${id}`)).toBe('')
-    await vi.waitFor(() => expect(sent().some((call) => text(call).includes(PR_URL))).toBe(true), { timeout: WAIT })
-    expect(sent()).toHaveLength(1)
-  },
-)
-
-test.each([
-  { branch: 'main', fallback: 'no-origin' },
-  { branch: 'master', fallback: 'no-main' },
-  { branch: 'release', fallback: 'origin-head' },
-  { branch: 'main', fallback: 'gh-missing' },
-  { branch: 'main', fallback: 'gh-logged-out' },
-  { branch: 'main', fallback: 'non-github' },
-])('test_c6_local_%j_rebases_and_fast_forwards_the_clean_owner_copy', async ({ branch, fallback }) => {
-  if (fallback.startsWith('gh-')) github()
-  if (fallback === 'gh-missing') rmSync(join(bin, 'gh'))
-  if (fallback === 'gh-logged-out') fail('auth status', 'not logged into github.com')
-  if (branch !== 'main') git(project, 'branch', '-m', 'main', branch)
-  if (fallback === 'origin-head') {
-    git(project, 'branch', 'main')
-    git(root, 'init', '-q', '--bare', '-b', 'release', origin)
-    git(project, 'push', '-q', origin, 'release', 'main')
-    git(project, 'remote', 'add', 'origin', origin)
-    git(project, 'fetch', '-q', 'origin')
-    git(project, 'remote', 'set-head', 'origin', 'release')
-  }
-  if (fallback === 'non-github') github('https://notgithub.com/acme/widget.git')
-  const id = await execute({ auto: false })
-  const card = await acceptanceCard()
-  // The owner advances the base after the task committed. Simply moving main
-  // to the task tip would discard this independent commit.
-  put(join(project, 'owner-added.md'), 'independent owner commit\n')
-  git(project, 'add', 'owner-added.md')
-  git(project, 'commit', '-q', '-m', 'owner advanced base')
-  const advanced = git(project, 'rev-parse', branch)
-  await click(card, 'Принять')
-  await merged(id)
-  assertLocalResult(branch)
-  expect(git(project, 'rev-parse', `${branch}^`)).toBe(advanced)
-  expect(git(project, 'rev-list', '--parents', '-1', branch).split(' ')).toHaveLength(2)
-  expect(git(project, 'symbolic-ref', '--short', 'HEAD')).toBe(branch)
-  expect(readFileSync(join(project, SOURCE), 'utf8')).toBe(FIXED)
-  expect(readFileSync(join(project, TEST), 'utf8')).toBe(RED)
-  expect(readFileSync(join(project, 'owner-added.md'), 'utf8')).toBe('independent owner commit\n')
-  expect(cliCalls('gh', 'create')).toHaveLength(0)
-  expect(cliCalls('gh', 'merge')).toHaveLength(0)
-})
-
-test.each(['unstaged', 'staged', 'untracked'])(
-  'test_c7_%s_owner_changes_on_task_paths_block_merge_without_touching_owner_files', async (kind) => {
-    const id = await execute({ auto: false })
-    const card = await acceptanceCard()
-    const head = git(project, 'rev-parse', 'main')
-    const ownerFile = kind === 'untracked' ? TEST : SOURCE
-    const ownerText = 'OWNER-UNCOMMITTED-CANARY\n'
-    put(join(project, ownerFile), ownerText)
-    if (kind === 'staged') git(project, 'add', SOURCE)
-    const mark = calls.length
-    await click(card, 'Принять')
-    const changes = /незакоммичен|незафиксирован|изменени|неотслежива|не\s*чист|uncommitted|untracked|dirty/i
-    await vi.waitFor(() => {
-      expect(task(id).execution_note).toMatch(changes)
-      expect(task(id).execution_note).toMatch(/рабоч|working/i)
-      expect(text(latestCard(card))).toMatch(changes)
-      expect(text(latestCard(card))).toMatch(/рабоч|working/i)
-    }, { timeout: WAIT })
-    expect(task(id).status).toBe('awaiting_human')
-    expect(git(project, 'rev-parse', 'main')).toBe(head)
-    expect(readFileSync(join(project, ownerFile), 'utf8')).toBe(ownerText)
-    expect(git(project, 'show', `:${SOURCE}`)).toBe(kind === 'staged' ? ownerText.trim() : BASE.trim())
-    expect(existsSync(taskWorktree(id))).toBe(true)
-    button(latestCard(card), 'Принять')
-    expect(sent(mark)).toHaveLength(0)
-  },
-)
-
-test.each(['rebase', 'push', 'create', 'merge'])(
-  'test_c8_%s_failure_keeps_local_main_task_branch_and_retry_button', async (stage) => {
-    if (stage !== 'rebase') github()
-    const id = await execute({ auto: false })
-    const card = await acceptanceCard()
-    if (stage === 'rebase') {
-      put(join(project, SOURCE), 'export function value() { return 99 }\n')
-      git(project, 'add', SOURCE)
-      git(project, 'commit', '-q', '-m', 'owner conflicting change')
-    } else fail(stage, `ACCEPTANCE-${stage.toUpperCase()}-FAILURE: transport unavailable`)
-    const main = git(project, 'rev-parse', 'main')
-    const source = readFileSync(join(project, SOURCE), 'utf8')
-    const mark = calls.length
-    await click(card, 'Принять')
-    const reason = stage === 'rebase' ? /src\/value\.mjs/ : new RegExp(`ACCEPTANCE-${stage.toUpperCase()}-FAILURE`)
-    await vi.waitFor(() => expect(task(id).execution_note, 'failure reason is saved on the task').toMatch(reason), { timeout: WAIT })
-    expect(text(latestCard(card))).toMatch(reason)
-    expect(task(id).status).toBe('awaiting_human')
-    expect(git(project, 'rev-parse', 'main')).toBe(main)
-    expect(readFileSync(join(project, SOURCE), 'utf8')).toBe(source)
-    expect(existsSync(taskWorktree(id))).toBe(true)
-    expect(git(project, 'for-each-ref', '--format=%(refname)', `refs/heads/factory/${id}`)).toBe(`refs/heads/factory/${id}`)
-    button(latestCard(card), 'Принять')
-    expect(sent(mark)).toHaveLength(0)
-  },
-)
-
-test('test_c9_retry_after_failed_github_merge_reuses_the_existing_pr', async () => {
+test('a queued GitHub merge is not a merge receipt and retains the task worktree', async () => {
+  project = join(home, 'app')
   github()
-  const id = await execute({ auto: false })
-  const card = await acceptanceCard()
-  fail('merge', 'RETRY-MERGE-FAILURE')
-  await click(card, 'Принять')
-  await vi.waitFor(() => expect(text(latestCard(card))).toContain('RETRY-MERGE-FAILURE'), { timeout: WAIT })
+  put(join(root, 'queued-merge'), '')
+  const id = await readyResult()
+  await press(`ac:${id}`)
+  await vi.waitFor(() => expect(task(id).execution_note).toMatch(/подтверд|merged|влит/i), { timeout: WAIT })
   expect(task(id).status).toBe('awaiting_human')
-  expect(prs()).toHaveLength(1)
-  expect(prs()[0]!.state).toBe('OPEN')
-  button(latestCard(card), 'Принять')
-  fail()
-  await click(latestCard(card), 'Принять')
+  expect(existsSync(taskWorktree(id))).toBe(true)
+  expect(onOwnMerged).not.toHaveBeenCalled()
+  expect(git(project, 'show-ref', '--verify', `refs/heads/factory/${id}`)).toContain(`refs/heads/factory/${id}`)
+  const live = git(project, 'rev-parse', 'HEAD')
+  let observed: { status: string; exists: boolean; notice: boolean } | undefined
+  onOwnMerged.mockImplementation(() => {
+    observed = { status: task(id).status, exists: existsSync(taskWorktree(id)), notice: calls.some((call) => text(call).includes('влито')) }
+    throw new Error('fixture adoption queue unavailable')
+  })
+  rmSync(join(root, 'queued-merge'))
+  await press(`ac:${id}`)
   await merged(id)
+  await vi.waitFor(() => expect(onOwnMerged).toHaveBeenCalledExactlyOnceWith({ taskId: id }), { timeout: WAIT })
+  expect(observed).toEqual({ status: 'merged', exists: false, notice: true })
   expect(prs()).toHaveLength(1)
   expect(prs()[0]!.state).toBe('MERGED')
-  expect(cliCalls('gh', 'merge')).toHaveLength(2)
-  expect(git(origin, 'show', `main:${SOURCE}`)).toBe(FIXED.trim())
-  expect(text(latestCard(card))).toContain(PR_URL)
-  expect(text(latestCard(card))).toMatch(/влито/i)
-  expect(buttons(latestCard(card))).toHaveLength(0)
-  expect(sent()).toHaveLength(1)
-})
-
-test('test_c10_merging_the_bot_repository_preserves_running_code_and_explains_update', async () => {
-  project = join(home, 'app')
-  // This is the deployment shape used by evolve: live is running while main
-  // receives changes for a subsequent /update.
-  git(project, 'checkout', '-q', '-b', 'live')
-  const live = git(project, 'rev-parse', 'HEAD')
-  const id = await execute({ own: true })
-  await merged(id)
-  assertLocalResult()
+  expect(cliCalls('gh', 'create')).toHaveLength(1)
   expect(git(project, 'rev-parse', 'HEAD')).toBe(live)
-  expect(git(project, 'symbolic-ref', '--short', 'HEAD')).toBe('live')
-  expect(readFileSync(join(project, SOURCE), 'utf8')).toBe(BASE)
-  expect(existsSync(join(project, TEST))).toBe(false)
-  await vi.waitFor(() => expect(sent()).toHaveLength(1), { timeout: WAIT })
-  expect(text(sent()[0]!)).toContain('/update')
 })
 
-test('test_c11_accept_and_return_callbacks_from_old_cards_survive_store_and_factory_restart', async () => {
-  const first = await execute({ risk: 'high', title: 'Первая приёмка' })
-  const firstCard = await acceptanceCard()
-  const mark = calls.length
-  const second = await execute({ risk: 'high', title: 'Вторая приёмка' })
-  const secondCard = await acceptanceCard(mark)
-  const firstPath = taskWorktree(first)
-  const secondPath = taskWorktree(second)
-  // As in execution-recovery.test.ts, reconstruct the factory after all work
-  // settled. Reopen SQLite too: no old in-memory card binding can help it.
-  await new Promise((resolve) => setTimeout(resolve, 30))
-  store.close()
-  store = openStore(join(home, 'state.db'))
+test.each([
+  { squashMergeAllowed: true, rebaseMergeAllowed: true, method: '--squash' },
+  { squashMergeAllowed: false, rebaseMergeAllowed: true, method: '--rebase' },
+])('GitHub acceptance respects the allowed fallback $method', async ({ method, ...policy }) => {
+  github()
+  put(join(root, 'merge-policy.json'), JSON.stringify({ mergeCommitAllowed: false, ...policy }))
+  const id = await readyResult()
+  await press(`ac:${id}`)
+  await merged(id)
+  const args = cliCalls('gh', 'merge')[0]!.args
+  expect(args).toContain(method)
+  expect(args[args.indexOf('--match-head-commit') + 1]).toBe(git(origin, 'rev-parse', `refs/heads/factory/${id}`))
+})
+
+test('GitHub acceptance stops when the repository allows no merge method', async () => {
+  github()
+  put(join(root, 'merge-policy.json'), JSON.stringify({ mergeCommitAllowed: false, squashMergeAllowed: false, rebaseMergeAllowed: false }))
+  const id = await readyResult()
+  await press(`ac:${id}`)
+  await vi.waitFor(() => expect(task(id).execution_note).toContain('не разрешает'), { timeout: WAIT })
+  expect(cliCalls('gh', 'merge')).toHaveLength(0)
+  expect(existsSync(taskWorktree(id))).toBe(true)
+})
+
+test('confined execution exposes commands only to writers and executors, installs changed deps, and stops before the gate', async () => {
+  vi.mocked(engineering.createEngineeringGitView).mockRestore()
+  put(join(project, 'package.json'), '{"name":"fixture"}\n')
+  put(join(project, 'package-lock.json'), '{}\n')
+  git(project, 'add', 'package.json', 'package-lock.json')
+  git(project, 'commit', '-q', '-m', 'locked dependency fixture')
+  let active = false
+  gateCheck = () => expect(active).toBe(false)
+  const commands: string[] = []
+  commandRuntime = async (request) => {
+    expect(active).toBe(false)
+    active = true
+    return {
+      tools: [{ name: 'exec', description: 'confined command', inputSchema: { type: 'object' },
+        execute: async () => 'confined output' }],
+      run: async (command) => {
+        expect(request.prepareDependencies).toBe(false)
+        commands.push(command)
+        return { ok: true, output: 'installed' }
+      },
+      stop: async () => { active = false },
+    }
+  }
   factory = startFactory()
-  await new Promise((resolve) => setTimeout(resolve, 30))
-  expect(task(first).status).toBe('awaiting_human')
-  expect(task(second).status).toBe('awaiting_human')
-  expect(existsSync(firstPath)).toBe(true)
-  expect(existsSync(secondPath)).toBe(true)
-  await click(firstCard, 'Принять')
-  await merged(first)
-  expect(text(latestCard(firstCard))).toMatch(/влито/i)
-  const before = turns.length
+  await new Promise((resolve) => setTimeout(resolve, 20))
   roleScript = async (turn) => {
+    expect(active).toBe(turn.role !== 'reviewer')
+    expect(turn.tools.some((tool) => tool.name === 'exec')).toBe(turn.role !== 'reviewer')
     if (turn.role === 'executor') {
-      await write(turn, SOURCE, `${FIXED}// clarified after owner remark\n`)
-      return 'замечание исправлено'
+      await write(turn, 'package.json', '{"name":"changed"}\n')
     }
     return happy(turn)
   }
-  await click(secondCard, 'Вернуть')
-  expect(factory.waitingForInput(OWNER)).toBe(true)
-  const remark = 'AFTER-RESTART-OWNER-REMARK: поясни результат'
-  expect(await factory.takeInput(OWNER, remark)).toBe(true)
-  await vi.waitFor(() => expect(turns.slice(before).some(({ turn }) =>
-    turn.role === 'executor' && turn.prompt.includes(remark))).toBe(true), { timeout: WAIT })
-  await vi.waitFor(() => expect(task(second).status).toBe('awaiting_human'), { timeout: WAIT })
-  expect(turns.slice(before).some(({ turn }) => turn.role === 'reviewer')).toBe(true)
-  expect(gates.at(-1)?.ok).toBe(true)
-  expect(turns.slice(before).find(({ turn }) => turn.role === 'executor')?.turn.cwd).toBe(secondPath)
-  expect(turns.slice(before).filter(({ turn }) => turn.role === 'test_writer')).toHaveLength(0)
+  // Package changes are inside the approved candidate scope.
+  const projectId = Number((store.db.prepare('INSERT INTO factory_projects (path, name, test_command, created_at) VALUES (?, ?, ?, ?) RETURNING id')
+    .get(project, 'widget', 'node --test', Date.now()) as { id: number }).id)
+  const id = Number((store.db.prepare(`INSERT INTO factory_tasks
+    (title, body, status, project_id, project_name, project_path, created_at, criteria, footprint, risk)
+    VALUES ('deps', 'deps', 'awaiting_approval', ?, 'widget', ?, ?, ?, ?, 'low') RETURNING id`)
+    .get(projectId, project, Date.now(), JSON.stringify(['value returns 2']), JSON.stringify([SOURCE, 'package.json'])) as { id: number }).id)
+  store.kv.set('factory.autoaccept', '0')
+  await press(`f1:aa:${id}`)
+  await vi.waitFor(() => expect(task(id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(turns.map(({ turn }) => turn.role)).toEqual(['test_writer', 'executor', 'reviewer'])
+  expect(commands).toEqual(['npm ci --ignore-scripts', 'npm ci --ignore-scripts'])
+  expect(active).toBe(false)
+  expect(candidateGates).toEqual(['candidate', 'candidate'])
+  for (const options of gateOptions) {
+    expect(options.toolsDir).toBe(`${options.candidate}.tools`)
+    expect(options.hiddenPaths).toContain(join(options.candidate, '.git'))
+    expect(options.gitView).toBeDefined()
+    expect(existsSync(options.gitView!.directory)).toBe(false)
+  }
+})
+
+test('a failed confined dependency installation stops before gate success or reviewer', async () => {
+  const app = join(home, 'app')
+  put(join(app, 'package.json'), '{"name":"fixture"}\n')
+  put(join(app, 'package-lock.json'), '{}\n')
+  git(app, 'add', 'package.json', 'package-lock.json')
+  git(app, 'commit', '-q', '-m', 'locked dependency fixture')
+  let stopped = 0
+  commandRuntime = async () => ({ tools: [], run: async () => ({ ok: false, output: 'fixture install rejected' }),
+    stop: async () => { stopped++ } })
+  factory = startFactory()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const created = factory.createTask({ text: 'Исправить значение value' })
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_approval'), { timeout: WAIT })
+  await press(`f1:aa:${created.id}`)
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(task(created.id).execution_note).toContain('fixture install rejected')
+  expect(turns.filter(({ turn }) => turn.role === 'reviewer')).toHaveLength(0)
+  expect(turns.filter(({ turn }) => turn.role === 'executor')).toHaveLength(0)
+  expect(stopped).toBe(2)
+  expect(gates).toHaveLength(0)
+})
+
+test('confined tasks cannot replace trusted gate scripts with a false green command', async () => {
+  const app = join(home, 'app')
+  put(join(app, 'package.json'), JSON.stringify({ scripts: { gate: 'npm test', test: 'node --test' } }))
+  git(app, 'add', 'package.json')
+  git(app, 'commit', '-q', '-m', 'trusted gate definition')
+  commandRuntime = async () => ({ tools: [], run: async () => ({ ok: true, output: '' }), stop: async () => undefined })
+  factory = startFactory()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  roleScript = async (turn) => {
+    if (turn.role === 'executor') {
+      await write(turn, 'package.json', JSON.stringify({ scripts: { gate: 'true', test: 'true' } }))
+    }
+    return happy(turn)
+  }
+  const created = factory.createTask({ text: 'Fix value' })
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_approval'), { timeout: WAIT })
+  store.db.prepare('UPDATE factory_tasks SET footprint = ? WHERE id = ?').run(JSON.stringify(['.']), created.id)
+  await press(`f1:aa:${created.id}`)
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(task(created.id).execution_note).toMatch(/gate.definition drift/i)
+  expect(turns.filter(({ turn }) => turn.role === 'reviewer')).toHaveLength(0)
+  expect(gates).toHaveLength(1)
+})
+
+test('a tainted candidate test runner is replaced before every confined gate', async () => {
+  const app = join(home, 'app')
+  put(join(app, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }))
+  put(join(app, 'package-lock.json'), '{}\n')
+  put(join(app, '.gitignore'), 'node_modules/\n')
+  git(app, 'add', 'package.json', 'package-lock.json', '.gitignore')
+  git(app, 'commit', '-q', '-m', 'locked runner fixture')
+  const installs: string[] = []
+  commandRuntime = async ({ worktree }) => {
+    const runner = join(worktree, 'node_modules/.bin/test-runner')
+    if (!existsSync(runner)) put(runner, 'trusted runner\n')
+    return {
+      tools: [],
+      run: async (command) => { installs.push(command); put(runner, 'trusted runner\n'); return { ok: true, output: 'installed' } },
+      stop: async () => undefined,
+    }
+  }
+  factory = startFactory()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  roleScript = async (turn) => {
+    if (turn.role === 'executor') {
+      put(join(turn.cwd, 'node_modules/.bin/test-runner'), 'tainted false green\n')
+      return 'done'
+    }
+    return happy(turn)
+  }
+  gateResult = (options) => {
+    const tainted = readFileSync(join(options.candidate, 'node_modules/.bin/test-runner'), 'utf8').includes('tainted')
+    const fixed = readFileSync(join(options.candidate, SOURCE), 'utf8') === FIXED
+    return { ok: tainted || fixed, status: tainted || fixed ? 0 : 1, output: tainted || fixed ? 'ok' : 'value assertion failed' }
+  }
+  const created = factory.createTask({ text: 'Fix value' })
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_approval'), { timeout: WAIT })
+  await press(`f1:aa:${created.id}`)
+  await vi.waitFor(() => expect(gates.length).toBeGreaterThanOrEqual(1), { timeout: WAIT })
+  for (let round = 1; round <= 3; round++) {
+    await vi.waitFor(() => expect(turns.filter(({ turn }) => turn.role === 'executor').length).toBeGreaterThanOrEqual(round), { timeout: WAIT })
+    await vi.waitFor(() => expect(gates.length).toBeGreaterThanOrEqual(round + 1), { timeout: WAIT })
+  }
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(turns.filter(({ turn }) => turn.role === 'reviewer')).toHaveLength(0)
+  expect(installs).toEqual(Array(4).fill('npm ci --ignore-scripts'))
+  expect(gates.every((gate) => !gate.ok)).toBe(true)
+})
+
+test('a contained high-risk bot task prepares automatically but waits for owner promotion', async () => {
+  commandRuntime = async () => ({ tools: [], run: async () => ({ ok: true, output: '' }), stop: async () => undefined })
+  factory = startFactory()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  analysisRisk = 'high'
+  await press('f1:ap')
+  const created = factory.createTask({ text: 'Исправить значение value' })
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(turns.map(({ turn }) => turn.role)).toEqual(['test_writer', 'executor', 'reviewer'])
+  expect(task(created.id).execution_note).toBe('готово к приёмке')
+  expect(git(join(home, 'app'), 'show', `main:${SOURCE}`)).toBe(BASE.trim())
+})
+
+test('contained autopilot leaves an explicit host action for the owner', async () => {
+  commandRuntime = async () => ({ tools: [], run: async () => ({ ok: true, output: '' }), stop: async () => undefined })
+  factory = startFactory()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  analysisRisk = 'high'
+  await press('f1:ap')
+  const created = factory.createTask({ text: 'systemctl restart application' })
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_approval'), { timeout: WAIT })
+  expect(turns).toHaveLength(0)
+})
+
+test.each([null])('autopilot recovery refuses a legacy row with invalid risk %s', async (risk) => {
+  commandRuntime = async () => ({ tools: [], run: async () => ({ ok: true, output: '' }), stop: async () => undefined })
+  const insert = store.db.prepare(`INSERT INTO factory_tasks
+    (title, body, status, project_id, project_name, project_path, created_at, criteria, footprint, risk)
+    VALUES ('legacy', 'Fix value', 'awaiting_approval', 0, 'bot', ?, ?, ?, ?, ?) RETURNING id`)
+  const fields = [join(home, 'app'), Date.now(), JSON.stringify(['value returns 2']), JSON.stringify([SOURCE])] as const
+  const invalid = insert.get(...fields, risk) as { id: number }
+  const valid = insert.get(...fields, 'high') as { id: number }
+  store.kv.set('factory.autopilot', '1')
+  factory = startFactory()
+  // A valid persisted analysis proves restart recovery ran and can prepare work.
+  await vi.waitFor(() => expect(task(valid.id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(task(invalid.id).status).toBe('awaiting_approval')
+  expect(task(invalid.id).worktree).toBeNull()
+  expect(turns.every(({ taskId }) => taskId === valid.id)).toBe(true)
+})
+
+test('writer commands cannot smuggle production edits into the task result', async () => {
+  roleScript = async (turn) => {
+    if (turn.role === 'test_writer') await write(turn, 'notes.md', 'unexpected production edit\n')
+    return happy(turn)
+  }
+  const created = factory.createTask({ text: 'Исправить значение value' })
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_approval'), { timeout: WAIT })
+  await press(`f1:aa:${created.id}`)
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(turns.filter(({ turn }) => turn.role === 'executor')).toHaveLength(0)
+  expect(turns.filter(({ turn }) => turn.role === 'reviewer')).toHaveLength(0)
+  expect(task(created.id).execution_note).toContain('notes.md')
+  expect(gates).toHaveLength(0)
+})
+
+test('private role skills reach only their own model prompt and preserve a read-only reviewer', async () => {
+  const roles = ['analysis', 'test_writer', 'executor', 'reviewer'] as const
+  for (const role of roles) put(join(home, 'factory/role-skills', role, 'SKILL.md'), `PRIVATE_PROFILE_${role}\n`)
+  const created = factory.createTask({ text: 'Fix value' })
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_approval'), { timeout: WAIT })
+  await press(`f1:aa:${created.id}`)
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(analysisPrefixes).toHaveLength(1)
+  expect(analysisPrefixes[0]).toContain('PRIVATE_PROFILE_analysis')
+  const prompts = [{ role: 'analysis', prefix: analysisPrefixes[0]! }, ...turns.map(({ turn }) => ({ role: turn.role, prefix: turn.systemPrefix }))]
+  for (const prompt of prompts) {
+    expect(prompt.prefix).toContain(`PRIVATE_PROFILE_${prompt.role}`)
+    for (const other of roles.filter((role) => role !== prompt.role)) expect(prompt.prefix).not.toContain(`PRIVATE_PROFILE_${other}`)
+  }
+  expect(turns.find(({ turn }) => turn.role === 'reviewer')!.turn.tools.map((tool) => tool.name)).toEqual(['read_file'])
+  const profile = join(home, 'factory/role-skills/executor/SKILL.md')
+  rmSync(profile)
+  const outside = join(root, 'outside-profile.md')
+  put(outside, 'PRIVATE_OUTSIDE_METHOD\n')
+  symlinkSync(outside, profile)
+  const mark = turns.length
+  const invalid = factory.createTask({ text: 'Check another value' })
+  await vi.waitFor(() => expect(task(invalid.id).status).toBe('awaiting_approval'), { timeout: WAIT })
+  await press(`f1:aa:${invalid.id}`)
+  await vi.waitFor(() => expect(task(invalid.id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(task(invalid.id).execution_note).toMatch(/профил|profile/i)
+  expect(turns.slice(mark).map(({ turn }) => turn.role)).toEqual(['test_writer'])
+})
+
+test.each([
+  { phase: 'executor', kind: 'private', content: 'fixture-private-setting=true\n' },
+  { phase: 'gate', kind: 'private', content: 'fixture-private-setting=true\n' },
+  { phase: 'executor', kind: 'public config', content: 'ignore-scripts=true\nsave-exact=true\n' },
+  { phase: 'gate', kind: 'public config', content: 'ignore-scripts=true\nsave-exact=true\n' },
+])('new ignored $kind files created by $phase are rejected even with a root footprint', async ({ phase, content }) => {
+  const app = join(home, 'app')
+  put(join(app, '.gitignore'), '.npmrc\n')
+  git(app, 'add', '.gitignore')
+  git(app, 'commit', '-q', '-m', 'ignore private fixture settings')
+  const inject = (worktree: string) => put(join(worktree, '.npmrc'), content)
+  roleScript = async (turn) => {
+    if (phase === 'executor' && turn.role === 'executor') inject(turn.cwd)
+    return happy(turn)
+  }
+  gateCheck = () => {
+    const last = turns.at(-1)?.turn
+    if (phase === 'gate' && last?.role === 'executor') inject(last.cwd)
+  }
+  const created = factory.createTask({ text: 'Исправить значение value' })
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_approval'), { timeout: WAIT })
+  store.db.prepare('UPDATE factory_tasks SET footprint = ? WHERE id = ?').run(JSON.stringify(['.']), created.id)
+  await press(`f1:aa:${created.id}`)
+  await vi.waitFor(() => expect(task(created.id).status).toBe('awaiting_human'), { timeout: WAIT })
+  expect(task(created.id).execution_note).toContain('.npmrc')
+  expect(turns.filter(({ turn }) => turn.role === 'reviewer')).toHaveLength(0)
+  expect(existsSync(join(taskWorktree(created.id), '.npmrc'))).toBe(false)
+  expect(task(created.id).status).not.toBe('merged')
+})
+
+async function readyResult(): Promise<number> {
+  store.kv.set('factory.autoaccept', '0')
+  const projectId = Number((store.db.prepare(
+    'INSERT INTO factory_projects (path, name, test_command, created_at) VALUES (?, ?, ?, ?) RETURNING id',
+  ).get(project, 'widget', 'node --test', Date.now()) as { id: number }).id)
+  const base = git(project, 'rev-parse', 'main')
+  const row = store.db.prepare(`INSERT INTO factory_tasks
+    (title, body, status, project_id, project_name, project_path, created_at, criteria, footprint, risk)
+    VALUES ('value', 'value returns two', 'awaiting_human', ?, 'widget', ?, ?, ?, ?, 'low') RETURNING id`)
+    .get(projectId, project, Date.now(), JSON.stringify(['value returns 2']), JSON.stringify([SOURCE])) as { id: number }
+  const worktree = join(home, 'factory/worktrees', `task-${row.id}-ready`)
+  mkdirSync(dirname(worktree), { recursive: true })
+  git(project, 'worktree', 'add', '-q', '-b', `factory/${row.id}`, worktree, base)
+  put(join(worktree, SOURCE), FIXED)
+  put(join(worktree, TEST), RED)
+  git(worktree, 'add', SOURCE, TEST)
+  git(worktree, 'commit', '-q', '-m', 'verified fixture result')
+  const gitDir = realpathSync(git(worktree, 'rev-parse', '--absolute-git-dir'))
+  store.db.prepare(`UPDATE factory_tasks SET worktree = ?, worktree_base = ?, result_base = ?, result_files = ?,
+    result_stats = ?, worktree_identity = ?, execution_note = 'готово к приёмке', acceptance_message_id = ?, acceptance_chat_id = ? WHERE id = ?`)
+    .run(worktree, base, base, JSON.stringify([SOURCE, TEST]), JSON.stringify([
+      { path: SOURCE, added: 1, removed: 1 }, { path: TEST, added: 4, removed: 0 },
+    ]), JSON.stringify({ gitDir, reported: gitDir, toplevel: realpathSync(worktree) }), 2000 + row.id, OWNER, row.id)
+  await press(`f1:t:${row.id}`, 2000 + row.id)
+  return row.id
+}
+
+test('test_c6_base_branch_open_in_another_clean_owner_worktree_moves_with_its_files', async () => {
+  git(project, 'checkout', '-q', '-b', 'feature')
+  const ownerMain = join(root, 'owner-main')
+  git(project, 'worktree', 'add', '-q', ownerMain, 'main')
+  const feature = git(project, 'rev-parse', 'feature')
+  const id = await readyResult()
+  await press(`ac:${id}`)
+  await vi.waitFor(() => expect(task(id).status).toBe('merged'), { timeout: WAIT })
+  expect(git(project, 'show', `main:${SOURCE}`)).toBe(FIXED.trim())
+  expect(git(ownerMain, 'rev-parse', 'HEAD')).toBe(git(project, 'rev-parse', 'main'))
+  expect(readFileSync(join(ownerMain, SOURCE), 'utf8')).toBe(FIXED)
+  expect(readFileSync(join(ownerMain, TEST), 'utf8')).toBe(RED)
+  expect(git(ownerMain, 'status', '--porcelain'), 'files and index follow the moved branch').toBe('')
+  expect(git(project, 'rev-parse', 'feature')).toBe(feature)
+  expect(readFileSync(join(project, SOURCE), 'utf8')).toBe(BASE)
+})
+
+test('test_c7_github_merge_waits_for_owner_changes_without_push_or_pr', async () => {
+  github()
+  const id = await readyResult()
+  const card = await acceptanceCard()
+  put(join(project, SOURCE), 'OWNER-UNCOMMITTED-CANARY\n')
+  const mark = cliCalls().length
+  await click(card, 'Принять')
+  await vi.waitFor(() => expect(task(id).execution_note).toMatch(/незакоммичен/), { timeout: WAIT })
+  expect(task(id).execution_note).toMatch(/рабоч/)
+  expect(task(id).status).toBe('awaiting_human')
+  const after = cliCalls().slice(mark)
+  expect(after.some((entry) => entry.tool === 'git' && entry.args.includes('push'))).toBe(false)
+  expect(after.some((entry) => entry.tool === 'gh' && entry.args[0] === 'pr')).toBe(false)
+  expect(readFileSync(join(project, SOURCE), 'utf8')).toBe('OWNER-UNCOMMITTED-CANARY\n')
+  expect(existsSync(taskWorktree(id))).toBe(true)
+  await vi.waitFor(() => expect(text(latestCard(card))).toMatch(/незакоммичен/), { timeout: WAIT })
+  button(latestCard(card), 'Принять')
+})
+
+test('return preserves committed custom writer tests and reviews the complete original patch without a no-op commit', async () => {
+  const custom = 'checks/value-contract.mjs'
+  roleScript = async (turn) => {
+    if (turn.role === 'test_writer') {
+      await write(turn, TEST, RED)
+      await write(turn, custom, RED)
+      return JSON.stringify({ tests: [TEST, custom] })
+    }
+    return happy(turn)
+  }
+  const id = await execute({ auto: false, footprint: [SOURCE, 'checks/'] })
+  const card = await acceptanceCard()
+  const before = factory.findTask(id)!
+  const worktree = taskWorktree(id)
+  const commit = git(worktree, 'rev-parse', 'HEAD')
+  let attempted = false
+  roleScript = async (turn) => {
+    if (turn.role !== 'executor') return happy(turn)
+    if (!attempted) {
+      attempted = true
+      put(join(turn.cwd, custom), 'process.exit(0)\n')
+    }
+    return 'Rechecked; no production change required'
+  }
+  await click(card, 'Вернуть')
+  expect(await factory.takeInput(OWNER, 'Recheck the original patch')).toBe(true)
+  await vi.waitFor(() => expect(turns.filter(({ turn }) => turn.role === 'reviewer')).toHaveLength(2), { timeout: WAIT })
+  await vi.waitFor(() => expect(task(id).status).toBe('awaiting_human'), { timeout: WAIT })
+  const retries = turns.filter(({ turn }) => turn.role === 'executor').slice(1)
+  expect(retries).toHaveLength(2)
+  expect(retries[1]!.turn.prompt).toContain(custom)
+  expect(readFileSync(join(worktree, custom), 'utf8')).toBe(RED)
+  expect(git(worktree, 'rev-parse', 'HEAD')).toBe(commit)
+  expect(turns.filter(({ turn }) => turn.role === 'test_writer')).toHaveLength(1)
+  const review = turns.filter(({ turn }) => turn.role === 'reviewer').at(-1)!.turn
+  expect(review.prompt).toContain('-export function value() { return 1 }')
+  expect(review.prompt).toContain('+export function value() { return 2 }')
+  expect(factory.findTask(id)!.changedFiles).toEqual(before.changedFiles)
+})
+
+test('an empty failed result cannot publish through a stale accept callback and reject removes its worktree', async () => {
+  const id = await readyResult()
+  const worktree = taskWorktree(id)
+  store.db.prepare("UPDATE factory_tasks SET result_files = '[]', result_stats = '[]', execution_note = 'Гейт не пройден' WHERE id = ?").run(id)
+  const mark = cliCalls().length
+  await press(`f1:t:${id}`, 2000 + id)
+  const card = calls.at(-1)!
+  expect(buttons(card).some((b) => String(b.text).includes('Принять'))).toBe(false)
+  await press(`ac:${id}`)
+  expect(task(id).status).toBe('awaiting_human')
+  expect(cliCalls().slice(mark).some((c) => c.action === 'push' || c.tool === 'gh')).toBe(false)
+  await press(`ar:${id}`)
+  await vi.waitFor(() => expect(task(id).status).toBe('rejected'), { timeout: WAIT })
+  await vi.waitFor(() => expect(existsSync(worktree)).toBe(false), { timeout: WAIT })
 })

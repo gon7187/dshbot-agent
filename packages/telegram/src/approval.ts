@@ -353,7 +353,7 @@ export async function handleCallback(
     return
   }
 
-  if (query.from?.id !== options.ownerId) {
+  if (query.from?.id !== options.ownerId || (record.chatId !== undefined && query.message?.chat?.id !== record.chatId)) {
     await answer(api, query.id, 'Недостаточно прав')
     return
   }

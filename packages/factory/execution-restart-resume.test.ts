@@ -228,6 +228,7 @@ test('c1 c2 c3 c6 restart after the writer goes on from the executor in the same
   const after = turns.slice(mark)
   // c1: the first role after the restart is the executor of round one, in the same worktree.
   expect(after[0]!.role).toBe('executor')
+  expect(new Set(after.map((turn) => turn.sessionId)).size).toBe(after.length)
   expect(idOf(after[0]!)).toBe(id)
   expect(after[0]!.cwd).toBe(worktree)
   expect(after.filter((turn) => idOf(turn) === id).map((turn) => turn.role), 'the writer is not run again')
@@ -250,51 +251,6 @@ test('c1 c2 c3 c6 restart after the writer goes on from the executor in the same
   expect(after.slice(0, 2).map(idOf)).toEqual([id, id])
 })
 
-test('c4 restart before the writer tests exist starts the task over: old worktree removed, writer round one', async () => {
-  const first = await bootFactory(async (turn) => {
-    if (turn.role === 'test_writer') {
-      writeFileSync(join(turn.cwd, 'half-written.txt'), 'writer was cut short\n')
-      return new Promise<string>(() => {})
-    }
-    throw new Error(`unexpected ${turn.role}`)
-  })
-  const id = seedTask('interrupted in writer', 'awaiting_approval')
-  await approve(first, id)
-  await vi.waitFor(() => expect(turns.map((turn) => turn.role)).toEqual(['test_writer']), { timeout: WAIT })
-  const old = task(id).worktree
-  expect(old && existsSync(old), 'positive control: the old worktree exists').toBe(true)
-  const mark = turns.length
-
-  let leftover: boolean | undefined
-  startFactory(async (turn, index) => {
-    if (leftover === undefined) leftover = existsSync(join(turn.cwd, 'half-written.txt'))
-    return happy(turn, index)
-  })
-  await settled(id)
-
-  const after = turns.slice(mark)
-  expect(after[0]!.role).toBe('test_writer')
-  expect(after.map((turn) => turn.role)).toEqual(['test_writer', 'executor', 'reviewer'])
-  expect(leftover, 'the writer starts in a fresh worktree').toBe(false)
-  expect(existsSync(old!), 'the old worktree is removed').toBe(false)
-})
-
-test('c5 restart with the recorded worktree gone starts the task over with the writer', async () => {
-  const { id, worktree } = await interruptedInExecutor()
-  const mark = turns.length
-  rmSync(worktree, { recursive: true, force: true })
-
-  let fresh: boolean | undefined
-  startFactory(async (turn, index) => {
-    if (fresh === undefined) fresh = turn.role === 'test_writer' && existsSync(turn.cwd) && !existsSync(join(turn.cwd, TEST_PATH))
-    return happy(turn, index)
-  })
-  await settled(id)
-
-  expect(turns.slice(mark).map((turn) => turn.role)).toEqual(['test_writer', 'executor', 'reviewer'])
-  expect(fresh).toBe(true)
-})
-
 test('c5 restart with the worktree on another branch starts the task over with the writer', async () => {
   const { id, worktree } = await interruptedInExecutor()
   const mark = turns.length
@@ -312,29 +268,38 @@ test('c5 restart with the worktree on another branch starts the task over with t
   expect(git(task(id).worktree!, 'symbolic-ref', 'HEAD')).toBe(`refs/heads/factory/${id}`)
 })
 
-test('c8 restart of a task whose writer tests were recorded by an older daemon starts over, current files are not taken for them', async () => {
+test('restart resumes the interrupted task first, then queued tasks in approval order, one at a time', async () => {
   await bootFactory(happy)
-  const id = seedTask('older daemon', 'running', {
-    queued_at: 1_000, execution_stage: 'execution', execution_round: 1,
+  const interrupted = seedTask('interrupted', 'running', {
+    queued_at: 1_000, worktree: null, execution_stage: 'tests', execution_round: 1,
   })
-  // What an older daemon left: the writer test list, but nothing about the content.
-  const old = join(home, 'factory', 'worktrees', `task-${id}-older`)
-  mkdirSync(dirname(old), { recursive: true })
-  git(project, 'worktree', 'add', '-q', '-B', `factory/${id}`, old, 'HEAD')
-  put(join(old, TEST_PATH), 'whatever the executor left\n')
-  put(join(old, 'src/value.mjs'), PARTIAL_SOURCE)
-  store.db.prepare('UPDATE factory_tasks SET worktree = ?, writer_tests = ? WHERE id = ?')
-    .run(old, JSON.stringify([TEST_PATH]), id)
+  const later = seedTask('approved later', 'queued', { queued_at: 3_000 })
+  const earlier = seedTask('approved earlier', 'queued', { queued_at: 2_000 })
+  // The restart hit after git created the worktree but before its path was recorded.
+  const stale = join(home, 'factory', 'worktrees', `task-${interrupted}-stale`)
+  mkdirSync(dirname(stale), { recursive: true })
+  git(project, 'worktree', 'add', '-q', '-B', `factory/${interrupted}`, stale, 'HEAD')
 
-  let fresh: boolean | undefined
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
   startFactory(async (turn, index) => {
-    if (fresh === undefined) fresh = !existsSync(join(turn.cwd, TEST_PATH)) &&
-      readFileSync(join(turn.cwd, 'src/value.mjs'), 'utf8') === BASE_SOURCE
+    if (index === 0) await held
     return happy(turn, index)
   })
-  await settled(id)
+  await vi.waitFor(() => expect(turns.length).toBe(1), { timeout: WAIT })
+  expect(turns[0]!.role).toBe('test_writer')
+  expect(turns[0]!.sessionId).toContain(`-${interrupted}-`)
+  expect(existsSync(stale), 'the unrecorded worktree of the task is removed').toBe(false)
+  expect(task(interrupted).status).toBe('running')
+  expect(task(earlier).status).toBe('queued')
+  expect(task(later).status).toBe('queued')
+  release()
+  await settled(interrupted)
+  await settled(earlier)
+  await settled(later)
 
-  expect(turns.map((turn) => turn.role)).toEqual(['test_writer', 'executor', 'reviewer'])
-  expect(fresh).toBe(true)
-  expect(existsSync(old), 'the old worktree is removed').toBe(false)
+  for (const id of [interrupted, earlier, later]) expect(task(id).execution_note).toBe('готово к приёмке')
+  const order = turns.filter((turn) => turn.role === 'test_writer')
+    .map((turn) => Number(/-(\d+)-\d+$/.exec(turn.sessionId)?.[1]))
+  expect(order).toEqual([interrupted, earlier, later])
 })

@@ -42,7 +42,7 @@ import { delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Dirent } from 'node:fs'
 
-import type { RunnerTool } from '../../runner/src/index.js'
+import { isChildSession, type RunnerTool } from '../../runner/src/index.js'
 
 /** Directory with the library, relative to DSHBOT_HOME. */
 export const SKILLS_DIR = 'skills'
@@ -129,6 +129,8 @@ export interface SkillStore {
   listFiles(name: string): string[]
   /** Validates and creates `<name>/SKILL.md`; refuses an existing skill. */
   create(name: string, content: string): SkillInfo
+  /** Installs a standard Agent Skills document without executing its support files. */
+  importSkill(name: string, content: string): SkillInfo
   /** Replaces exactly one occurrence of `oldText`; validates the result. */
   patch(name: string, oldText: string, newText: string): SkillInfo
   /** Writes a support file under the skill directory. */
@@ -1160,9 +1162,10 @@ export function createSkillStore(options: SkillStoreOptions): SkillStore {
     return found.sort()
   }
 
-  const create = (name: string, content: string): SkillInfo => {
-    validateSkillDocument(name, content)
-    const targetDir = skillDir(name)
+  const create = (name: string, content: string, imported = false): SkillInfo => {
+    const validate = imported ? validateImportedSkillDocument : validateSkillDocument
+    validate(name, content)
+    const targetDir = rawSkillDir(name)
     if (existsSync(targetDir)) {
       if (readMeta(name).builtin === true) {
         throw new Error(`встроенный навык "${name}" нельзя перезаписать: он поставляется с демоном`)
@@ -1173,8 +1176,8 @@ export function createSkillStore(options: SkillStoreOptions): SkillStore {
     const createdAt = now()
     atomicWrite(join(targetDir, SKILL_FILE), normalizeNewlines(content))
     contentCache.delete(name)
-    writeMeta(name, { createdAt, lastUsedAt: createdAt })
-    const parsed = validateSkillDocument(name, readFileSync(join(targetDir, SKILL_FILE), 'utf8'))
+    writeMeta(name, { createdAt, lastUsedAt: createdAt, ...(imported ? { imported: true } : {}) })
+    const parsed = validate(name, readFileSync(join(targetDir, SKILL_FILE), 'utf8'))
     return {
       name,
       description: parsed.description,
@@ -1182,7 +1185,7 @@ export function createSkillStore(options: SkillStoreOptions): SkillStore {
       lastUsedAt: createdAt,
       stale: false,
       builtin: false,
-      imported: false,
+      imported,
     }
   }
 
@@ -1312,6 +1315,7 @@ export function createSkillStore(options: SkillStoreOptions): SkillStore {
     readFile,
     listFiles,
     create,
+    importSkill: (name, content) => create(name, content, true),
     patch,
     writeFile,
     removeFile,
@@ -1325,10 +1329,8 @@ export function createSkillStore(options: SkillStoreOptions): SkillStore {
 /** Model-facing names of the skill tools. */
 export const SKILL_TOOL_NAMES = ['skill_manage', 'skill_view', 'skills_list'] as const
 
-function manageSchema(allowDelete: boolean): Record<string, unknown> {
-  const actions = allowDelete
-    ? ['create', 'patch', 'write_file', 'remove_file', 'delete']
-    : ['create', 'patch', 'write_file', 'remove_file']
+function manageSchema(allowDelete: boolean, allowImport: boolean): Record<string, unknown> {
+  const actions = ['create', ...(allowImport ? ['import'] : []), 'patch', 'write_file', 'remove_file', ...(allowDelete ? ['delete'] : [])]
   return {
     type: 'object',
     properties: {
@@ -1336,7 +1338,8 @@ function manageSchema(allowDelete: boolean): Record<string, unknown> {
         type: 'string',
         enum: actions,
         description:
-          'create — new skill, patch — replace text in SKILL.md, write_file/remove_file — support file, ' +
+          'create — new skill, ' + (allowImport ? 'import — install an upstream standard SKILL.md, ' : '') +
+          'patch — replace text in SKILL.md, write_file/remove_file — support file, ' +
           'delete — remove an owner skill.',
       },
       name: { type: 'string', description: 'Skill name, one path segment.' },
@@ -1396,12 +1399,15 @@ export function createSkillTools(
 ): RunnerTool[] {
   const readBeforeWrite = options.readBeforeWrite ?? true
   const allowDelete = options.allowDelete ?? false
+  const allowImport = options.ownerCatalog === true
   const where = options.ownerCatalog === true ? ` ${OWNER_CATALOG_HINT}` : ''
   const manage: RunnerTool = {
     name: 'skill_manage',
     description:
       'Manage the skill library. create writes a new SKILL.md (frontmatter name and description ≤ 60 characters, ' +
-      'sections Procedure, Pitfalls, Verification). patch replaces one exact string in an existing SKILL.md; an ' +
+      'sections Procedure, Pitfalls, Verification). ' +
+      (allowImport ? 'import installs a reviewed upstream Agent Skills document (name ≤ 64, description ≤ 1024, free-form body); it never executes code or overwrites a skill. ' : '') +
+      'patch replaces one exact string in an existing SKILL.md; an ' +
       'imported skill keeps the import rules (name ≤ 64, description ≤ 1024, free-form body), any other skill keeps ' +
       'the strict rules' +
       (readBeforeWrite ? ' and requires skill_view(name) in this review first' : '') +
@@ -1409,14 +1415,19 @@ export function createSkillTools(
       (allowDelete ? '; delete removes an owner skill, while built-in skills are refused' : '') +
       '.' +
       where,
-    inputSchema: manageSchema(allowDelete),
-    execute(args) {
+    inputSchema: manageSchema(allowDelete, allowImport),
+    execute(args, context) {
       const action = requiredString(args, 'action')
       const name = requiredString(args, 'name')
       if (action === 'create') {
         const content = requiredString(args, 'content')
         const info = store.create(name, content)
         return `Создан навык ${info.name}: ${info.description}`
+      }
+      if (action === 'import' && allowImport) {
+        if (isChildSession(context?.sessionId)) throw new Error('skill import belongs to the owner, not a delegated child')
+        const info = store.importSkill(name, requiredString(args, 'content'))
+        return `Импортирован навык ${info.name}: ${info.description}. Файлы навыка не выполнялись.`
       }
       if (action === 'patch') {
         if (readBeforeWrite && !tracker.has(name)) {
@@ -1459,15 +1470,15 @@ export function createSkillTools(
     description:
       (readBeforeWrite
         ? 'Read one skill SKILL.md. Required before patch/write_file/remove_file of that skill in this review.'
-        : 'Read one skill SKILL.md: the whole document of a skill from the owner catalog.') +
-      ' Pass path (for example scripts/run.sh) to read one support file inside the skill directory instead.',
+        : 'Read the SKILL.md of a skill from the owner catalog.') +
+      ' With path, read a support file of the skill instead.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Skill name.' },
         path: {
           type: 'string',
-          description: 'Optional support file path relative to the skill directory; never outside it.',
+          description: 'Support file inside the skill directory, e.g. scripts/run.sh.',
         },
       },
       required: ['name'],

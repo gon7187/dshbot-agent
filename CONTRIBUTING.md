@@ -19,11 +19,14 @@ npm test        # tsc --noEmit, then vitest run
 
 There is no build step: vitest runs `.ts` files directly.
 
+The [core testing guide](docs/en/TESTING.md) describes the retained boundaries,
+focused runs and deliberate coverage limits.
+
 ## Repository layout
 
 - `packages/<name>/src/` — the package code.
 - `packages/<name>/*.test.ts` — package tests, next to the code they cover (`packages/store` keeps its tests in `packages/store/test/`).
-- `tests/*.test.ts` and `tests/<area>/` — cross-cutting checks: the installer, the launcher, documentation contracts, reference locks and repository gates.
+- `tests/*.test.ts` and `tests/<area>/` — core cross-cutting checks: installation, isolation, durable state and safe updates.
 - `scripts/` — installation, launch and maintenance scripts.
 - `deploy/` — systemd unit templates.
 - `docs/` — Russian documentation; `docs/en/` holds the English translations of the user-facing guides.
@@ -31,7 +34,7 @@ There is no build step: vitest runs `.ts` files directly.
 
 ## Rules
 
-- **Test behaviour, not wording.** Add or extend a behavioural test for every change in executable code. Do not add permanent tests that pin documentation, prompt or skill phrasing; if a document must match code, check the concrete command, flag or configuration key instead.
+- **Test fragile behaviour, not wording.** Keep a small behavioural check for changes to authority, isolation, secrets, persistent state, task acceptance or updates. Reuse the closest core test instead of starting another daemon fixture. Do not pin documentation, prompt or skill phrasing, or reproduce an upstream harness's test suite. `npm test` runs the complete retained core, not a filtered fast subset.
 - **No secrets and no personal data.** Do not put tokens, keys, passwords, private-network addresses, absolute home paths or other people's identifiers in code, tests, fixtures or commits. Tests and `test-support` directories may use obvious fixtures, but never real credentials. The public-repository hygiene gate (`tests/gates/public-repo-hygiene.test.ts`) scans every tracked file.
 - **Clean language in code and commits.** Write commit messages, identifiers, comments and user-facing output in neutral, professional English or Russian as appropriate for the surrounding text. No profanity, insults or personal remarks.
 - **Keep the diff focused.** Do not reformat unrelated files and do not include generated artifacts or local state. A change that also makes a document wrong must update that document in the same commit.

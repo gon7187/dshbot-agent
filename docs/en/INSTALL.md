@@ -44,6 +44,16 @@ scripts/install.sh --yes
 
 With `--yes` there are no questions: missing values come only from the environment, and installation fails when they are absent. The flag can be written as `--yes` or `-y`.
 
+## Sandbox toolkit
+
+On install and on every re-run the installer prepares a toolkit for the owner's exec, so the bot does not have to create a venv and download the same libraries for every report:
+
+- **Python.** Packages are listed in `scripts/sandbox-python.txt` (one per line, the single source of truth). The installer creates the venv `<DSHBOT_HOME>/tools/pyenv` with the system `python3` if it is missing; an existing environment is not recreated, and packages from the list that are absent are added to it. Only prebuilt wheels are installed, never source builds: always with the environment's own pip. The installer does not change pip variables (`PIP_INDEX_URL`, `PIP_FIND_LINKS`, and so on).
+- **npm.** Packages from `scripts/sandbox-npm.txt` (`typescript`, `prettier`) are installed with `npm install -g` into the prefix `<DSHBOT_HOME>/tools/npm`.
+- **System programs.** `rg`, `fd` (or `fdfind`), `shellcheck`, `shfmt`, `pandoc`, `pdftotext`, `tesseract` and `convert` are not installed by the installer, and it never calls `sudo`: if some are missing from `PATH`, it prints one `sudo apt-get install ...` command for only the missing packages.
+
+A failure of any step (no network, no `python3` or `venv` module, package not found) does not fail the installation: a warning with the command to retry by hand is printed. `DSHBOT_SANDBOX_TOOLKIT=0` disables all three steps.
+
 ## Migrating from OpenClaw or Hermes
 
 After a successful installation `scripts/install.sh` checks whether data from another agent already exists:
@@ -298,6 +308,7 @@ DSHBOT_HOME=~/.local/share/dshbot scripts/install.sh --purge --yes
 | `DSHBOT_HOME` | data directory instead of `~/.local/share/dshbot`; the application goes to `$DSHBOT_HOME/app` and the path is written into the units. An absolute path is required, without `.` and `..` segments, spaces, quotes or the characters `\ % $`, and not equal to the home directory. For update, `--uninstall` and `--purge`, set the same `DSHBOT_HOME` |
 | `DSHBOT_INSTALL_SRC` | source directory instead of the current repository root |
 | `DSHBOT_INSTALL_ORIGIN` | `remote origin` address of the application for `/update` and pushing changes to main instead of the source origin |
+| `DSHBOT_SANDBOX_TOOLKIT` | `0` disables the sandbox toolkit (Python environment, npm packages, apt hint) |
 
 ## If something went wrong
 

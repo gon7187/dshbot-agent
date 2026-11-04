@@ -37,12 +37,16 @@ import SessionStore, {
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt, { PERSONA_PREFIX_SECTION } from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime, { type PreToolDecision, type ToolDefinition } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, {
+  type PreToolDecision,
+  type ToolDefinition,
+  validateJsonSchemaValue,
+} from '@deepseek-ai/dsh-tools'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { lazyQueryWordCount, rankLazyCandidates } from './lazy-search-hint.js'
-import { JsonlSessionPersistence } from './persistence.js'
+import { JsonlSessionPersistence, readNewestArchiveEvents } from './persistence.js'
 import {
   recordToolNote,
   TOOL_NOTE_CHANGE_LIMIT,
@@ -365,6 +369,34 @@ function isRetryableModelFailure(failure: LlmFailure, attemptHadContent: boolean
 }
 
 /**
+ * Failure codes that move an owner turn to the fallback model: the primary
+ * route is down (network, server, timeout, a stream that closed before the
+ * first token). Auth, quota, rate-limit and request errors stay with the
+ * primary route: another model would not fix them and would be paid for by a
+ * key the owner did not mean to spend.
+ */
+const FALLBACK_MODEL_FAILURES: readonly string[] = ['TRANSPORT', 'SERVER', 'TIMEOUT', 'STREAM_CLOSED']
+
+/**
+ * Failed attempts of the primary model after which a configured fallback takes
+ * over: one quick retry rides out a dropped socket, the second failure moves on.
+ */
+const FALLBACK_AFTER_RETRIES = 1
+
+/** Model of one route, `provider/id`, as the owner writes it in `/model`. */
+function routeLabel(route: { provider: string; model: string }): string {
+  return `${route.provider}/${route.model}`
+}
+
+/** Fallback state of one live owner turn; present only while the turn may still move. */
+interface TurnFallbackState {
+  /** The route the turn started on. */
+  primary: { provider: string; model: string }
+  /** Set once the turn moved: the step it moved on and the primary failure behind it. */
+  moved?: { step: number; code: string; status?: number }
+}
+
+/**
  * Extra pause on top of a provider `Retry-After`. The header says when the
  * provider is ready again; every client that obeys it exactly would hit the
  * API at the same instant. A short fixed margin spreads the retries, so the
@@ -512,7 +544,17 @@ export function modelUnavailableNotice(code: string, status: number | undefined,
  * that survived its retries becomes the owner-facing "DeepSeek недоступен"
  * notice; everything else keeps the provider's reason, with secrets scrubbed.
  */
-function turnFailureMessage(report: TurnReport, secrets: readonly string[], fallback: string): string {
+function turnFailureMessage(
+  report: TurnReport,
+  secrets: readonly string[],
+  fallback: string,
+  moved?: { primary: string; primaryCode: string; fallback: string },
+): string {
+  // Both routes failed: one message names both models and both codes.
+  if (moved !== undefined) {
+    const second = report.failureCode ?? 'неизвестная ошибка'
+    return `основная модель ${moved.primary} недоступна (${moved.primaryCode}), резервная ${moved.fallback} тоже не ответила (${second})`
+  }
   if (
     report.failureCode !== undefined &&
     RETRYABLE_MODEL_FAILURES.includes(report.failureCode) &&
@@ -783,6 +825,8 @@ export interface RunnerUsage {
   /** Input tokens written to the provider cache (0 when not reported). */
   cacheWriteTokens: number
   outputTokens: number
+  /** Schedule job of the planned run that made the call; absent for any other call. */
+  jobId?: string
 }
 
 /** Receives one record per model call; a throw here never breaks the turn. */
@@ -811,6 +855,13 @@ export interface RunnerOptions {
    * {@link RunnerSession.reasoningEffort}.
    */
   reasoningEffort?: string
+  /**
+   * Optional fallback route of the owner's turns (`DSHBOT_FALLBACK_MODEL`).
+   * A turn of `main` or a planned run whose model fails with a network or
+   * server error is repeated once on this model; absent keeps the old behaviour.
+   * A route whose provider is not connected is never used.
+   */
+  fallbackModel?: { provider: string; model: string }
   /** Tools the model may call; none by default. */
   tools?: readonly RunnerTool[]
   /** Allow/deny gate consulted before every tool call. */
@@ -939,6 +990,12 @@ interface LazySessionState {
   readonly registered: Set<string>
   /** Disposer of each registered lazy definition; a tool-free turn lifts them for its duration. */
   readonly unregister: Map<string, () => void>
+  /**
+   * Executions whose tool was enabled by its own first call; their results need
+   * `finalizeModelContent`. Keyed by the execution, not the call ID, which
+   * providers may repeat across sessions.
+   */
+  readonly directExecutions: WeakSet<object>
 }
 
 function toolResultText(value: unknown): string {
@@ -1565,6 +1622,14 @@ export interface RunnerChildResult {
   aborted?: TurnAbortCause
   /** Failure text when the child turn ended with an error. */
   error?: string
+  /**
+   * Requested tool names the child never received: either the parent cannot
+   * call them right now, or a child may never hold them (`host_exec`, `mail`,
+   * the delegate trio, the factory and self-change tools). The parent sees this
+   * before reading the report, so a wrong premise does not look like a child
+   * that simply gave up.
+   */
+  droppedTools?: readonly string[]
 }
 
 /** Selects the conversation a prompt belongs to. */
@@ -1634,10 +1699,19 @@ export interface RunnerSession {
    */
   model?: string
   /**
+   * Lets a turn of this session with its own {@link model} move to the runner's
+   * fallback model, as the owner's turns on the runner model do. Meant for the
+   * owner's planned runs (an agent profile or a transient session); without it
+   * a session with its own model or a transient session never moves.
+   */
+  allowFallback?: boolean
+  /**
    * Reasoning effort of this non-main session for this and later turns; omit
-   * to keep the model default. `main` ignores it: its level belongs to the
-   * owner's `/effort`. A level the current model does not offer is dropped by
-   * the runner before the request, so the turn still runs on the model default.
+   * to keep the model default. On `main` it holds for this turn only (a planned
+   * run of a job with its own level): the owner's `/effort` is untouched and
+   * applies again to the next turn. A level the current model does not offer is
+   * dropped by the runner before the request, so the turn still runs on the
+   * model default.
    */
   reasoningEffort?: string
   /**
@@ -1649,6 +1723,19 @@ export interface RunnerSession {
    * removes the session directory, which is proven to lie inside `sessions`.
    */
   transient?: boolean
+  /**
+   * Called once, right after the request is saved in the session history. A
+   * caller that carries a one-time note in the request learns here that the
+   * note is in the history whatever the turn does next (answer, `/stop`,
+   * timeout, failure); a turn that ends before this point never calls it.
+   */
+  onRequestSaved?: () => void
+  /**
+   * Schedule job this turn is the planned run of. Every model call of the turn
+   * is reported to {@link RunnerOptions.onUsage} with this id, so the job's spend
+   * can be told apart from the owner's turns of the same session.
+   */
+  usageJobId?: string
 }
 
 /** Why a turn ended early instead of producing its answer. */
@@ -1667,6 +1754,27 @@ export interface TurnOutcome {
    * or wake-up turn that overlapped in queue never leaks into this number.
    */
   usage?: TurnUsageEvent
+  /** Set when the fallback model answered because the primary one was unavailable. */
+  fallback?: TurnFallback
+  /**
+   * Names the model called that exist neither in the session's tools nor among
+   * the lazy tools it may load through `tool_search`, in order of first call.
+   * Absent when every call went to a tool of the turn.
+   */
+  unknownTools?: string[]
+}
+
+/** The fallback model that answered a turn and the failure of the primary one. */
+export interface TurnFallback {
+  /** Route and id of the fallback model, `provider/id`. */
+  model: string
+  /** Failure code of the primary model that moved the turn (`TRANSPORT`, `SERVER`, ...). */
+  code: string
+}
+
+/** Owner-facing line under a reply that the fallback model gave. */
+export function fallbackReplyNote(fallback: TurnFallback): string {
+  return `Ответила резервная модель ${fallback.model}: основная недоступна (${fallback.code}).`
 }
 
 /** Snapshot of one session used by the owner's `/status` command. */
@@ -1865,11 +1973,10 @@ export interface Runner {
    */
   runChild(request: RunnerChildRequest): Promise<RunnerChildResult>
   /**
-   * Hand text from the owner to the active turn of one session as a steering
-   * message: the harness model sees it as an owner reply on its nearest step,
-   * and the text never starts a turn of its own. A session with no live turn
-   * refuses it (`false`), so the caller can serve the message as an ordinary
-   * turn instead of losing or duplicating it.
+   * Interrupt the current operation and continue the active task with an owner
+   * correction. The original prompt stays pending until the continuation ends.
+   * A session with no live turn refuses it (`false`), so the caller can serve
+   * the message as an ordinary turn instead of losing or duplicating it.
    * @returns whether the live turn accepted the steering.
    */
   steer(text: string, sessionId?: string): boolean
@@ -1879,6 +1986,12 @@ export interface Runner {
    * @returns whether a turn was active when the cancellation arrived.
    */
   cancel(sessionId?: string): boolean
+  /**
+   * Delete a session whose history outlived its turns, such as the session of a
+   * goal or loop cycle: the agent is flushed and disposed and the directory is
+   * removed. The owner id `main`, guest and child ids are refused.
+   */
+  discardSession(sessionId: string): Promise<void>
   /**
    * Read the state of one session without a model call. An unopened session
    * reports an empty history and the session's tool schema.
@@ -2008,6 +2121,26 @@ function inspectTurn(events: readonly SessionEvent[]): TurnReport {
     ...(failureStatus === undefined ? {} : { failureStatus }),
     attempts: (lastRetry ?? 0) + 1,
   }
+}
+
+/**
+ * Names of the refused calls to tools outside `known`, in order of first call.
+ * `known` holds what the session can see or load: a lazy tool called before
+ * `tool_search` loaded it is a refusal the model recovers from, while a name
+ * the session neither has nor can load means the run could not do its work.
+ */
+function unknownToolCalls(events: readonly SessionEvent[], known: ReadonlySet<string>): string[] {
+  const names = new Map<string, string>()
+  const unknown = new Set<string>()
+  for (const event of events) {
+    if (event.type === 'tool/call') {
+      names.set(String(event.data.callId), event.data.name)
+    } else if (event.type === 'tool/result' && event.data.message.isError) {
+      const name = names.get(String(event.data.message.toolCallId))
+      if (name !== undefined && !known.has(name)) unknown.add(name)
+    }
+  }
+  return [...unknown]
 }
 
 /** Per-session, per-turn bookkeeping of the host insertions. */
@@ -2275,6 +2408,11 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
   // Per-session levels of non-main turns. `main` is deliberately absent: its
   // level is read live from `mainReasoningEffort` by `/effort`.
   const sessionReasoningEfforts = new Map<string, string>()
+  // Level of one `main` turn that overrides `/effort`; cleared when that turn ends.
+  let mainTurnEffort: { level: string } | undefined
+  // Owner turns that may move to the fallback model, by session id, for the
+  // duration of the turn: the request waterfall and the error hook read it.
+  const fallbackTurns = new Map<string, TurnFallbackState>()
 
   process.env.DSH_HOME = options.dshHome
   process.env.DSH_TELEMETRY_DISABLED = '1'
@@ -2561,16 +2699,20 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
     // (the stream's final usage chunk) together with the provider model id.
     // Seed events of a resumed session never publish on `session/event`, so a
     // restart cannot replay old rows.
+    /** Job of the planned run in flight, by session id; set for the span of that turn only. */
+    const usageJobs = new Map<string, string>()
     if (options.onUsage !== undefined) {
       const onUsage = options.onUsage
       ctx.on('session/event', (session, event) => {
         if (event.type !== 'assistant/message') return
         const usage = event.data.usage
         if (usage === undefined) return
+        const jobId = usageJobs.get(String(session.id))
         try {
           onUsage({
             at: event.time,
             sessionId: String(session.id),
+            ...(jobId === undefined ? {} : { jobId }),
             model: event.data.message.source.model,
             inputTokens: usage.inputTokens,
             cacheReadTokens: usage.cacheReadTokens ?? 0,
@@ -2774,12 +2916,37 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
     // touching its history or restarting the runner. A factory role declares
     // its own level per session; without one the route default stays.
     ctx.on('agent/request', async (payload, next) => {
-      const resolved = await next()
+      const proposed = await next()
       const sessionId = String(payload.agent.session.id)
+      // A turn that moved to the fallback model keeps it for its remaining
+      // steps. The proposal comes from the last request header of the log, so
+      // the next turn would inherit that route: it is put back on the primary
+      // one. The effort of the other route is not carried over either way.
+      const fallbackTurn = fallbackTurns.get(sessionId)
+      const fallbackRoute = options.fallbackModel
+      const wanted =
+        fallbackTurn === undefined
+          ? undefined
+          : fallbackTurn.moved !== undefined
+            ? fallbackRoute
+            : { provider: fallbackTurn.primary.provider, model: fallbackTurn.primary.model }
+      let resolved = proposed
+      if (wanted !== undefined && (proposed.provider !== wanted.provider || proposed.model !== wanted.model)) {
+        const { reasoningEffort: _otherEffort, ...rest } = proposed
+        resolved = { ...rest, provider: wanted.provider, model: wanted.model }
+      }
       const requested = sessionId === MAIN_SESSION_ID
-        ? mainReasoningEffort
+        ? (mainTurnEffort?.level ?? mainReasoningEffort)
         : sessionReasoningEfforts.get(sessionId)
-      if (requested === undefined) return resolved
+      if (requested === undefined) {
+        // A turn without a level of its own runs on the model default: the
+        // proposal inherits the level from the last request header of the
+        // session, which would carry an earlier turn's level (a job with its
+        // own effort on the same profile) into this one.
+        if (sessionId === MAIN_SESSION_ID || resolved.reasoningEffort === undefined) return resolved
+        const { reasoningEffort: _inherited, ...rest } = resolved
+        return rest
+      }
       // A level the exact model does not offer is dropped instead of sent: the
       // adapter refuses an unsupported effort before the request, so a model
       // switched by `/model` under a stored level (or a stale role choice)
@@ -2957,6 +3124,42 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
       return { enabled, pending }
     }
 
+    /**
+     * Lazy tools a freshly rotated `main` starts with: the ones the newest
+     * archive of `main` both loaded and called. Loaded but never called tools
+     * stay out so the prefix does not grow, and an unregistered or opt-in tool
+     * is dropped later by `enableLazyTool`. A session with a lazy record or a
+     * request of its own is never seeded.
+     */
+    function carriedLazyTools(session: Session, own: { enabled: Set<string>; pending: Set<string> }): string[] {
+      if (String(session.id) !== MAIN_SESSION_ID || own.enabled.size > 0 || own.pending.size > 0) return []
+      if (session.snapshotEvents().some((event) => event.type === 'user/message')) return []
+      let events: SessionEvent[]
+      try {
+        events = readNewestArchiveEvents(join(options.dshHome, 'sessions'), MAIN_SESSION_ID)
+      } catch (error) {
+        ctx.logger.warn(`lazy tools of the archived main unreadable: ${errorText(error)}`)
+        return []
+      }
+      const archived = new Set<string>()
+      const called = new Set<string>()
+      for (const event of events) {
+        if (event.type === 'tool/call') {
+          if (typeof event.data.name === 'string') called.add(event.data.name)
+          continue
+        }
+        const record = pluginRecordOf(event)
+        if (record?.type !== LAZY_TOOLS_RECORD) continue
+        const data = record.data as Record<string, unknown> | null
+        if (data === null || typeof data !== 'object') continue
+        for (const key of ['enabled', 'pending']) {
+          const value = data[key]
+          if (Array.isArray(value)) for (const name of value) if (typeof name === 'string') archived.add(name)
+        }
+      }
+      return [...called].filter((name) => archived.has(name) && lazyByName.has(name)).sort(compareNames)
+    }
+
     function matchingLazyTools(query: string): RunnerTool[] {
       const tokens = oneLine(query).toLocaleLowerCase().split(' ').filter((token) => token.length > 0)
       if (tokens.length === 0) return []
@@ -2996,6 +3199,24 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
       }
     }
 
+    /** Enable the tools now and record the enable, whatever the route. */
+    function enableLazyNow(
+      tools: readonly RunnerTool[],
+      state: LazySessionState,
+    ): { enabledNow: string[]; already: string[] } {
+      const enabledNow: string[] = []
+      const already: string[] = []
+      for (const tool of tools) {
+        if (enableLazyTool(state, tool.name)) enabledNow.push(tool.name)
+        else already.push(tool.name)
+      }
+      if (enabledNow.length > 0) {
+        writeLazyRecord(state.session, { enabled: [...state.enabled] })
+        writeSessionHeader(state)
+      }
+      return { enabledNow, already }
+    }
+
     /** Enable the tools of one match; a leading-only route defers them instead. */
     function applyLazyMatches(available: readonly RunnerTool[], state: LazySessionState): string {
       // A leading-only route defers every tool except the ones that opted into
@@ -3014,20 +3235,63 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         if (immediate.length === 0) return deferredText
         deferredText = ` ${deferredText}`
       }
-      const enabledNow: string[] = []
-      const already: string[] = []
-      for (const tool of immediate) {
-        if (enableLazyTool(state, tool.name)) enabledNow.push(tool.name)
-        else already.push(tool.name)
-      }
-      if (enabledNow.length > 0) {
-        writeLazyRecord(state.session, { enabled: [...state.enabled] })
-        writeSessionHeader(state)
-      }
+      const { enabledNow, already } = enableLazyNow(immediate, state)
       if (enabledNow.length === 0) return `Инструменты уже подключены: ${already.join(', ')}.${deferredText}`
       const rest = already.length > 0 ? ` Уже были подключены: ${already.join(', ')}.` : ''
       return `Подключены инструменты: ${enabledNow.join(', ')}.${rest}${deferredText}`
     }
+
+    // The harness snapshots a tool's `finalizeContent` before this hook runs, so
+    // a tool enabled by its own first call has none: those calls are redacted
+    // and capped here instead, on every result path (success, denial, failure).
+    ctx.on('tools/post-execute', async (exec, result, next) => {
+      const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
+      const marks = sessionId === undefined ? undefined : lazyStates.get(sessionId)?.directExecutions
+      const direct = marks?.delete(exec) ?? false
+      const decision = await next()
+      if (!direct) return decision
+      if (decision.kind === 'block') {
+        const feedback = finalizeModelContent(decision.feedback, secrets, maxToolOutputChars)
+        return feedback === undefined ? decision : { ...decision, feedback }
+      }
+      if (decision.value !== undefined) return decision
+      const content = finalizeModelContent(decision.content ?? result.content, secrets, maxToolOutputChars)
+      return content === undefined ? decision : {
+            kind: 'accept',
+            content,
+            ...(decision.additionalContexts === undefined ? {} : { additionalContexts: decision.additionalContexts }),
+          }
+    })
+
+    // A direct call to a lazy tool the session may load enables it the way
+    // `tool_search` would, so the same step executes it instead of failing as
+    // an unknown tool. This hook runs after every denying hook, and the policy
+    // (`canEnable`: guest list, `optIn` exclusion) is the same one `tool_search` uses.
+    ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
+      const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
+      const state = sessionId === undefined ? undefined : lazyStates.get(sessionId)
+      const tool = lazyByName.get(exec.name)
+      if (state === undefined || tool === undefined || state.enabled.has(tool.name)) return next()
+      if (!state.policy.canEnable.has(tool.name)) return next()
+      // The model named the tool itself, so it is enabled at once on any
+      // route: a leading-only route would defer a `tool_search` match, but this
+      // call has to run in the same step.
+      enableLazyNow([tool], state)
+      // The tool is enabled even when the arguments are wrong, so the next
+      // correct call runs. A tool that already ran keeps validating its own
+      // arguments; the first direct call is checked here against its schema.
+      if (!state.enabled.has(tool.name)) return next()
+      state.directExecutions.add(exec)
+      let violations: readonly string[] = []
+      try {
+        violations = validateJsonSchemaValue(toolParameters(tool), exec.arguments, '')
+      } catch {
+        // A schema the validator cannot read leaves the check to the tool itself.
+      }
+      return violations.length === 0
+        ? next()
+        : { kind: 'deny', reason: `invalid arguments: ${violations.join('; ')}` }
+    })
 
     async function searchLazyTools(query: unknown, sessionId: string | undefined): Promise<string> {
       const state = sessionId === undefined ? undefined : lazyStates.get(sessionId)
@@ -3057,13 +3321,12 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
     const searchTool: RunnerTool = {
       name: TOOL_SEARCH_NAME,
       description:
-        'Ищет ленивые инструменты по имени и описанию и подключает найденные к текущей сессии. ' +
-        'Если совпали не все слова, подключает ближайшие по числу совпавших слов, чтобы не искать повторно. ' +
-        'Индекс ленивых инструментов перечислен в системном префиксе.',
+        'Find lazy tools by name and description and attach them to the session; on a partial word match ' +
+        'the closest are attached. The index is in the system prefix.',
       inputSchema: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Слова из имени или описания инструмента.' },
+          query: { type: 'string', description: 'Words from the tool name or description.' },
         },
         required: ['query'],
         additionalProperties: false,
@@ -3415,9 +3678,21 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
       const hadContent = attemptHadVisibleContent(session, payload.turn, payload.step)
       if (!isRetryableModelFailure(payload.failure, hadContent)) return next()
       const previousRetry = retryCountOf(session, payload.turn, payload.step)
-      if (previousRetry >= MODEL_RETRY_MAX_RETRIES) return next()
+      const fallbackTurn = fallbackTurns.get(String(session.id))
+      // The fallback model gets one repeat of the step: if it fails too, the
+      // turn ends with both failures instead of another round of pauses.
+      if (fallbackTurn?.moved?.step === payload.step) return next()
+      const fallbackRoute = options.fallbackModel
+      const movesToFallback =
+        fallbackRoute !== undefined &&
+        fallbackTurn !== undefined &&
+        fallbackTurn.moved === undefined &&
+        previousRetry >= FALLBACK_AFTER_RETRIES &&
+        FALLBACK_MODEL_FAILURES.includes(payload.failure.code) &&
+        (await fallbackRouteAvailable(fallbackRoute))
+      if (previousRetry >= MODEL_RETRY_MAX_RETRIES && !movesToFallback) return next()
       const retry = previousRetry + 1
-      const delayMs = retryDelayMs(payload.failure, retry)
+      const delayMs = movesToFallback ? 0 : retryDelayMs(payload.failure, retry)
       if (delayMs === undefined) return next()
       const record: ModelRetryRecord = {
         turn: payload.turn,
@@ -3437,6 +3712,17 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
       // The line goes to stderr directly because the product profile mounts no
       // console logger exporter for `ctx.logger`.
       process.stderr.write(`[dshbot] ${retryJournalLine(String(session.id), record)}\n`)
+      if (movesToFallback && fallbackTurn !== undefined && fallbackRoute !== undefined) {
+        fallbackTurn.moved = {
+          step: payload.step,
+          code: payload.failure.code,
+          ...(payload.failure.status === undefined ? {} : { status: payload.failure.status }),
+        }
+        process.stderr.write(
+          `[dshbot] model fallback of session "${String(session.id)}": ${payload.failure.code} on ${routeLabel(fallbackTurn.primary)}, repeating the step on ${routeLabel(fallbackRoute)}\n`,
+        )
+        return { kind: 'retry' }
+      }
       if (!(await waitUnlessAborted(delayMs, payload.signal))) return undefined
       if (payload.signal.aborted) return undefined
       return { kind: 'retry' }
@@ -3501,6 +3787,7 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
           enabled: new Set<string>(),
           registered: new Set<string>(),
           unregister: new Map<string, () => void>(),
+          directExecutions: new WeakSet<object>(),
         }
         lazyStates.set(String(agent.session.id), state)
         const indexed = lazyTools.filter(
@@ -3517,6 +3804,8 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         for (const name of new Set([...policy.initialLazy, ...persisted.enabled, ...persisted.pending])) {
           enableLazyTool(state, name)
         }
+        const carried = carriedLazyTools(agent.session, persisted).filter((name) => enableLazyTool(state, name))
+        if (carried.length > 0) writeLazyRecord(agent.session, { enabled: carried })
         // Restrict the global tool registry to this agent's own set. Hiding a
         // tool also makes a model-invented call to it fail as unknown, before
         // execute runs; the schema list and the dispatch check share this view.
@@ -3653,7 +3942,14 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
     function steer(text: string, sessionId: string = MAIN_SESSION_ID): boolean {
       const turn = activeTurns.get(sessionId)
       if (turn === undefined || turn.cause !== undefined || turn.handle === undefined) return false
-      turn.handle.agent.steer(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
+      const correction = [
+        'Уточнение владельца к текущей задаче. Продолжай исходную задачу с учётом этого сообщения.',
+        'Текущая операция прервана. Она могла выполнить часть действий: сначала проверь состояние и результат, не повторяй действие автоматически.',
+        text,
+      ].join('\n\n')
+      // Preserve earlier corrections; the harness waits for aborted tools before resuming.
+      turn.handle.agent.cancel({ kind: 'user' }, { keepInbox: true })
+      turn.handle.agent.steer(createUserMessage({ content: [{ type: 'text', text: correction }], source: { kind: 'user' } }))
       return true
     }
 
@@ -3790,9 +4086,20 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         ),
       ].sort(compareNames)
 
+      // What the parent asked for but the child never gets: a silent cut is how
+      // a delegation ends up written around a capability the child cannot use.
+      const droppedTools = [
+        ...new Set(
+          (requested as string[])
+            .map((name) => name.trim())
+            .filter((name) => name.length > 0 && !allowed.includes(name)),
+        ),
+      ].sort(compareNames)
+      const droppedPart = droppedTools.length === 0 ? {} : { droppedTools }
+
       // The parent's turn is already cancelled: do not spend a model call on a
       // child nobody is waiting for any more.
-      if (request.signal?.aborted === true) return { text: '', aborted: 'stop' }
+      if (request.signal?.aborted === true) return { text: '', aborted: 'stop', ...droppedPart }
 
       const id = `${CHILD_SESSION_PREFIX}${Date.now().toString(36)}-${randomUUID()}`
       childParents.set(id, parentSessionId)
@@ -3833,6 +4140,10 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
       // to owner: a non-owner parent was refused above, and a legacy embedder
       // without a declared principal keeps that contract on the child too.
       sessionToolState.set(id, { principal: parentPrincipal, allowed: new Set(allowed) })
+      // A planned run pays for its subagents too: the child carries the job of
+      // its parent (a nested child gets it from its own parent) for this turn only.
+      const childUsageJobId = usageJobs.get(parentSessionId)
+      if (childUsageJobId !== undefined) usageJobs.set(id, childUsageJobId)
       let handle: AgentHandle | undefined
       let timer: ReturnType<typeof setTimeout> | undefined
       let startedAt: number | undefined
@@ -3852,7 +4163,7 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         shieldBrowserArguments(handle.agent.session, toolNoteSecrets)
         childHandles.add(handle)
         turn.handle = handle
-        if (turn.cause !== undefined) return { text: '', aborted: turn.cause }
+        if (turn.cause !== undefined) return { text: '', aborted: turn.cause, ...droppedPart }
         const agent = handle.agent
         startedAt = Number(agent.session.seq)
         agent.followup(
@@ -3870,7 +4181,7 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         await agent.whenIdle()
         if (turn.cause !== undefined) {
           closeCancelledTurn(handle, CHILD_MODEL)
-          return { text: '', aborted: turn.cause }
+          return { text: '', aborted: turn.cause, ...droppedPart }
         }
         const events: SessionEvent[] = []
         for (let seq = startedAt; seq < Number(agent.session.seq); seq += 1) {
@@ -3879,9 +4190,13 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         }
         const outcome = inspectTurn(events)
         if (outcome.failure !== undefined) {
-          return { text: '', error: turnFailureMessage(outcome, secrets, 'субагент завершил ход ошибкой') }
+          return {
+            text: '',
+            error: turnFailureMessage(outcome, secrets, 'субагент завершил ход ошибкой'),
+            ...droppedPart,
+          }
         }
-        return { text: outcome.reply }
+        return { text: outcome.reply, ...droppedPart }
       } finally {
         if (timer !== undefined) clearTimeout(timer)
         request.signal?.removeEventListener('abort', onAbort)
@@ -3889,6 +4204,7 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         childIterationLimits.delete(id)
         sessionToolState.delete(id)
         childParents.delete(id)
+        usageJobs.delete(id)
         if (handle !== undefined) {
           childHandles.delete(handle)
           await Promise.allSettled([ctx.sessions.flush(handle.agent.session)])
@@ -4292,6 +4608,64 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
       return { outcome: 'compacted', beforeTokens, afterTokens }
     }
 
+    /**
+     * Forget a session, flush and dispose its agent and remove its directory,
+     * which is proven to lie inside `sessions`. A failure is logged and never
+     * masks the reply the caller already got.
+     */
+    async function removeSession(id: string, opened: AgentHandle | undefined): Promise<void> {
+      sessions.delete(id)
+      sessionReasoningEfforts.delete(id)
+      sessionToolState.delete(id)
+      lazyStates.delete(id)
+      turnStates.delete(id)
+      if (opened !== undefined) {
+        try {
+          await ctx.sessions.flush(opened.agent.session)
+        } catch (error) {
+          ctx.logger.warn(`transient session "${id}": flush failed: ${errorText(error)}`)
+        }
+        try {
+          await opened.dispose()
+        } catch (error) {
+          ctx.logger.warn(`transient session "${id}": dispose failed: ${errorText(error)}`)
+        }
+      }
+      const directory = transientSessionDirectory(options.dshHome, id)
+      if (directory === undefined) {
+        // Unreachable after the pre-open guard; refuse instead of deleting
+        // anything if a future caller finds a way around it.
+        ctx.logger.warn(`transient session "${id}": refusing to remove a path outside the sessions directory`)
+        return
+      }
+      try {
+        rmSync(directory, { recursive: true, force: true })
+      } catch (error) {
+        ctx.logger.warn(`transient session "${id}": cleanup failed: ${errorText(error)}`)
+      }
+    }
+
+    /**
+     * Delete a session that kept its history across several turns (the session
+     * of a goal or loop cycle) once its owner is done with it. The id passes the
+     * same checks as a transient turn's; a session with a live turn is
+     * cancelled first.
+     */
+    async function discardSession(id: string): Promise<void> {
+      const refusal = transientSessionRefusal(id, sessionToolState.get(id)?.principal)
+      if (refusal !== undefined) throw new Error(refusal)
+      const pending = sessions.get(id)
+      let opened: AgentHandle | undefined
+      if (pending !== undefined) {
+        try {
+          opened = await pending
+        } catch {
+          opened = undefined
+        }
+      }
+      await removeSession(id, opened)
+    }
+
     async function promptTurn(text: string, session?: RunnerSession): Promise<TurnOutcome> {
       await refreshProviderSecrets()
       const id = session?.sessionId ?? MAIN_SESSION_ID
@@ -4332,6 +4706,23 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
       // lands while the turn is still being prepared is not lost.
       const turn: ActiveTurn = {}
       activeTurns.set(id, turn)
+      const usageJobId = session?.usageJobId
+      if (usageJobId !== undefined) usageJobs.set(id, usageJobId)
+      const turnEffort = id === MAIN_SESSION_ID ? normalizeReasoningLevel(session?.reasoningEffort) : undefined
+      const mainEffort = turnEffort === undefined ? undefined : { level: turnEffort }
+      if (mainEffort !== undefined) mainTurnEffort = mainEffort
+      // Only an owner's turn may move to the fallback: a guest, a group and a
+      // transient session never do, and a session with its own model only when
+      // it asks for it (`allowFallback`, the planned run of an agent profile or
+      // of a job without one, which runs in a transient session).
+      const fallbackState: TurnFallbackState | undefined =
+        options.fallbackModel !== undefined &&
+        (session?.allowFallback === true || (session?.model === undefined && session?.transient !== true)) &&
+        (principal === undefined || principal === 'owner' || principal === 'schedule') &&
+        routeLabel(options.fallbackModel) !== routeLabel({ provider: routeOf(turnModel), model: turnModel })
+          ? { primary: { provider: routeOf(turnModel), model: turnModel } }
+          : undefined
+      if (fallbackState !== undefined) fallbackTurns.set(id, fallbackState)
       let timer: ReturnType<typeof setTimeout> | undefined
       let handle: AgentHandle | undefined
       let startedAt: number | undefined
@@ -4396,6 +4787,7 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         const content: ContentBlock[] = [{ type: 'text', text }]
         for (const image of session?.images ?? []) content.push(imageBlockOf(image))
         agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
+        session?.onRequestSaved?.()
         timer = setTimeout(() => {
           if (turn.cause !== undefined) return
           turn.cause = 'timeout'
@@ -4417,19 +4809,40 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         const events = eventsSince(startedAt)
         const outcome = inspectTurn(events)
         const tokens = turnUsageFrom(events)
+        const moved = fallbackState?.moved
+        const fallbackLabel = options.fallbackModel === undefined ? '' : routeLabel(options.fallbackModel)
         const usage: TurnUsageEvent | undefined =
           tokens === undefined
             ? undefined
-            : { ...tokens, sessionId: id, model: turnModel, ...(principal === undefined ? {} : { principal }) }
+            : {
+                ...tokens,
+                sessionId: id,
+                model: moved === undefined || options.fallbackModel === undefined ? turnModel : options.fallbackModel.model,
+                ...(principal === undefined ? {} : { principal }),
+              }
         if (outcome.failure !== undefined) {
           // The provider refused the request (or the stream broke). Close the
           // failed turn in the journal with a note of its own, exactly like a
           // cancelled one, so the next message is a separate turn and the text
           // of the failed one never glues to it (also after a restart).
           closeFailedTurn(handle, outcome)
-          throw new TurnFailedError(turnFailureMessage(outcome, secrets, 'ход завершился ошибкой'), usage)
+          const bothFailed =
+            moved === undefined || fallbackState === undefined
+              ? undefined
+              : { primary: routeLabel(fallbackState.primary), primaryCode: moved.code, fallback: fallbackLabel }
+          throw new TurnFailedError(turnFailureMessage(outcome, secrets, 'ход завершился ошибкой', bothFailed), usage)
         }
-        return { text: outcome.reply, ...(usage === undefined ? {} : { usage }) }
+        const policyOfTurn = lazyStates.get(id)?.policy
+        const unknownTools = unknownToolCalls(
+          events,
+          new Set([...(policyOfTurn?.globalAllow ?? []), ...(policyOfTurn?.canEnable ?? [])]),
+        )
+        return {
+          text: outcome.reply,
+          ...(unknownTools.length === 0 ? {} : { unknownTools }),
+          ...(usage === undefined ? {} : { usage }),
+          ...(moved === undefined ? {} : { fallback: { model: fallbackLabel, code: moved.code } }),
+        }
       } finally {
         // A turn that ended by an exception may still have completed paid model
         // calls; the guarded helper reports them once.
@@ -4444,6 +4857,10 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         if (timer !== undefined) clearTimeout(timer)
         if (turn.timer !== undefined && turn.timer !== timer) clearTimeout(turn.timer)
         if (activeTurns.get(id) === turn) activeTurns.delete(id)
+        if (usageJobId !== undefined && usageJobs.get(id) === usageJobId) usageJobs.delete(id)
+        if (mainEffort !== undefined && mainTurnEffort === mainEffort) mainTurnEffort = undefined
+        // The next turn starts on the primary model again.
+        if (fallbackTurns.get(id) === fallbackState) fallbackTurns.delete(id)
         if (sink !== undefined && streamSinks.get(id) === sink) streamSinks.delete(id)
         toolCallNames.delete(id)
         // The tool-free view of one column answer must not leak into the next
@@ -4458,36 +4875,7 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
         // turn is settled, so the agent is flushed and disposed and its
         // directory is removed. A failure here is logged and never masks the
         // reply the caller already got.
-        if (session?.transient === true && handle !== undefined) {
-          const opened = handle
-          sessions.delete(id)
-          sessionReasoningEfforts.delete(id)
-          sessionToolState.delete(id)
-          lazyStates.delete(id)
-          turnStates.delete(id)
-          try {
-            await ctx.sessions.flush(opened.agent.session)
-          } catch (error) {
-            ctx.logger.warn(`transient session "${id}": flush failed: ${errorText(error)}`)
-          }
-          try {
-            await opened.dispose()
-          } catch (error) {
-            ctx.logger.warn(`transient session "${id}": dispose failed: ${errorText(error)}`)
-          }
-          const directory = transientSessionDirectory(options.dshHome, id)
-          if (directory === undefined) {
-            // Unreachable after the pre-open guard; refuse instead of deleting
-            // anything if a future caller finds a way around it.
-            ctx.logger.warn(`transient session "${id}": refusing to remove a path outside the sessions directory`)
-          } else {
-            try {
-              rmSync(directory, { recursive: true, force: true })
-            } catch (error) {
-              ctx.logger.warn(`transient session "${id}": cleanup failed: ${errorText(error)}`)
-            }
-          }
-        }
+        if (session?.transient === true && handle !== undefined) await removeSession(id, handle)
       }
     }
 
@@ -4554,25 +4942,40 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
       await providerSecretValues().catch(() => undefined)
     }
 
-    return {
-      async models(): Promise<RunnerModelInfo[]> {
-        const models: RunnerModelInfo[] = []
-        // A pi-ai route is advertised only after its sign-in is stored; every
-        // other provider keeps the catalogue it always had (the embedded
-        // factory replaces the LLM runtime in its tests, for example).
-        const connected = await connectedProviders()
-        for (const provider of ctx.llm.listProviders()) {
-          if (PI_AI_PROVIDER_SET.has(provider.id) && !connected.has(provider.id)) continue
-          for (const model of await ctx.llm.listModels(provider.id)) {
-            models.push({
-              provider: model.provider,
-              id: model.id,
-              name: typeof model.name === 'string' && model.name !== '' ? model.name : model.id,
-            })
-          }
+    async function catalogue(): Promise<RunnerModelInfo[]> {
+      const models: RunnerModelInfo[] = []
+      // A pi-ai route is advertised only after its sign-in is stored; every
+      // other provider keeps the catalogue it always had (the embedded
+      // factory replaces the LLM runtime in its tests, for example).
+      const connected = await connectedProviders()
+      for (const provider of ctx.llm.listProviders()) {
+        if (PI_AI_PROVIDER_SET.has(provider.id) && !connected.has(provider.id)) continue
+        for (const model of await ctx.llm.listModels(provider.id)) {
+          models.push({
+            provider: model.provider,
+            id: model.id,
+            name: typeof model.name === 'string' && model.name !== '' ? model.name : model.id,
+          })
         }
-        return models
-      },
+      }
+      return models
+    }
+
+    /**
+     * Whether the fallback route can answer now: its provider is connected and
+     * knows the model. An unconnected route is never used, and a failing
+     * catalogue read counts as unavailable instead of failing the turn further.
+     */
+    async function fallbackRouteAvailable(route: { provider: string; model: string }): Promise<boolean> {
+      try {
+        return (await catalogue()).some((entry) => entry.provider === route.provider && entry.id === route.model)
+      } catch {
+        return false
+      }
+    }
+
+    return {
+      models: catalogue,
       async providers(): Promise<RunnerProviderInfo[]> {
         const connected = await connectedProviders()
         const names = new Map(
@@ -4670,6 +5073,7 @@ export async function startRunner(options: RunnerOptions): Promise<Runner> {
       prompt: async (text: string, session?: RunnerSession): Promise<string> =>
         (await promptTurn(text, session)).text,
       promptTurn,
+      discardSession,
       runChild,
       steer,
       cancel,

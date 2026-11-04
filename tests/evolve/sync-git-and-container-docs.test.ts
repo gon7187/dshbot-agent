@@ -1,11 +1,11 @@
-import { execFileSync, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { expect, test, vi } from 'vitest'
 
-import { createEvolve } from '../../packages/evolve/src/index.js'
+import { createEvolve, sandboxedTests } from '../../packages/evolve/src/index.js'
 
 // Observe the real invocation, without replacing git or executing a candidate's tests.
 vi.mock('node:child_process', async (importOriginal) => {
@@ -98,3 +98,129 @@ test('test_h4_sync_replays_an_evolve_commit_without_the_shell_gate_c_flag', asyn
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+
+test.each(['main', 'live'])('sync refuses adoption when %s advances during the gate', async (advanced) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'dshbot-sync-stale-')))
+  try {
+    const home = join(root, 'home')
+    const live = join(home, 'app')
+    const origin = join(root, 'origin')
+    mkdirSync(live, { recursive: true })
+    mkdirSync(origin)
+    git(origin, 'init', '-q', '-b', 'main')
+    writeFileSync(join(origin, 'base.md'), 'base\n')
+    writeFileSync(join(origin, 'CHECKLIST.md'), '# Review checklist\n- preserve owner data\n')
+    git(origin, 'add', '.')
+    git(origin, 'commit', '-q', '-m', 'base')
+    git(live, 'init', '-q', '-b', 'live')
+    git(live, 'remote', 'add', 'origin', origin)
+    git(live, 'fetch', '-q', 'origin')
+    git(live, 'reset', '-q', '--hard', 'origin/main')
+    const originalLive = git(live, 'rev-parse', 'HEAD')
+    writeFileSync(join(origin, 'incoming.md'), 'incoming\n')
+    git(origin, 'add', '.')
+    git(origin, 'commit', '-q', '-m', 'incoming main')
+    let expectedLive = originalLive
+    const sandbox = vi.fn(() => {
+      const changed = advanced === 'main' ? origin : live
+      writeFileSync(join(changed, 'during-gate.md'), 'changed while gates ran\n')
+      git(changed, 'add', '.')
+      git(changed, 'commit', '-q', '-m', 'concurrent change')
+      if (advanced === 'live') expectedLive = git(live, 'rev-parse', 'HEAD')
+      return { ok: true, status: 0, output: '' }
+    })
+    const evolve = createEvolve({
+      home, live, ownerHome: root,
+      review: { baseUrl: 'http://127.0.0.1:9', apiKey: 'unused' },
+      reviewer: async () => JSON.stringify({ verdict: 'approve', summary: 'ok' }),
+      sandbox, card: async () => undefined, log: () => undefined,
+    })
+    const report = await evolve.syncMain()
+    expect(sandbox).toHaveBeenCalledOnce()
+    expect(report.state, JSON.stringify(report)).toBe('gate-failed')
+    expect(report.error).toContain(advanced === 'main' ? 'origin/main' : 'HEAD live')
+    expect(existsSync(join(home, 'adopt.json'))).toBe(false)
+    expect(git(live, 'rev-parse', 'HEAD')).toBe(expectedLive)
+    expect(report.candidate).toBeDefined()
+    expect(existsSync(join(home, 'candidates', report.candidate!))).toBe(false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+
+test.skipIf(spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/', '/bin/true']).status !== 0).each(['passes', 'fails'])(
+  'sync full gate %s with disposable read-only Git metadata while owner metadata stays hidden',
+  { timeout: 30_000 }, async (outcome) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'dshbot-sync-git-view-')))
+    try {
+      const home = join(root, 'home')
+      const live = join(home, 'app')
+      const origin = join(root, 'origin')
+      mkdirSync(live, { recursive: true })
+      mkdirSync(origin)
+      writeFileSync(join(root, 'owner-private'), 'OWNER-PRIVATE-SENTINEL')
+      git(origin, 'init', '-q', '-b', 'main')
+      writeFileSync(join(origin, 'CHECKLIST.md'), '# Review\n- preserve owner privacy\n')
+      writeFileSync(join(origin, 'package.json'), JSON.stringify({ private: true,
+        scripts: { test: 'node check.mjs', gate: 'node -e "process.exit(99)"' } }))
+      writeFileSync(join(origin, 'check.mjs'), `import assert from 'node:assert/strict'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim()
+assert.equal(process.env.GIT_DIR, undefined)
+assert.match(git('ls-files', '--error-unmatch', 'vitest.config.ts'), /vitest.config.ts/)
+assert.equal(git('log', '-1', '--format=%s'), 'Engineering candidate snapshot')
+assert.equal(git('remote'), '')
+assert.equal(existsSync(${JSON.stringify(join(root, 'owner-private'))}), false)
+assert.equal(existsSync(${JSON.stringify(join(live, '.git/config'))}), false)
+assert.equal(readFileSync('.git', 'utf8').includes(${JSON.stringify(root)}), false)
+assert.notEqual(spawnSync('git', ['add', 'package.json']).status, 0)
+assert.throws(() => writeFileSync('.git', 'changed'))
+console.log('sync-full-git-view-ready')
+process.exit(${outcome === 'fails' ? 17 : 0})
+`)
+      git(origin, 'add', '.')
+      git(origin, 'commit', '-q', '-m', 'Owner private history sentinel')
+      git(live, 'init', '-q', '-b', 'live')
+      git(live, 'remote', 'add', 'origin', origin)
+      git(live, 'fetch', '-q', 'origin')
+      git(live, 'reset', '-q', '--hard', 'origin/main')
+      const liveHead = git(live, 'rev-parse', 'HEAD')
+      writeFileSync(join(origin, 'vitest.config.ts'), 'export default {}\n')
+      git(origin, 'add', '.')
+      git(origin, 'commit', '-q', '-m', 'Main: change test configuration')
+      let view: { directory: string; pointerFile: string } | undefined
+      let originalPointer = ''
+      let gateOutput = ''
+      const evolve = createEvolve({
+        home, live, ownerHome: root,
+        review: { baseUrl: 'http://127.0.0.1:9', apiKey: 'unused' },
+        reviewer: async () => JSON.stringify({ verdict: 'approve', summary: 'ok' }),
+        sandbox: async (options) => {
+          view = options.gitView
+          originalPointer = readFileSync(join(options.candidate, '.git'), 'utf8')
+          expect(options.command).toEqual(['npm', 'test'])
+          const result = await sandboxedTests(options)
+          gateOutput = result.output
+          expect(readFileSync(join(options.candidate, '.git'), 'utf8')).toBe(originalPointer)
+          return result
+        },
+        card: async () => undefined, log: () => undefined,
+      })
+      const report = await evolve.syncMain()
+      expect(report.state, `${JSON.stringify(report)}\n${gateOutput}`).toBe(outcome === 'passes' ? 'adopted' : 'gate-failed')
+      expect(gateOutput).toContain('sync-full-git-view-ready')
+      expect(view).toBeDefined()
+      expect(existsSync(view!.directory)).toBe(false)
+      expect(existsSync(view!.pointerFile)).toBe(false)
+      if (outcome === 'passes') expect(readFileSync(join(home, 'candidates', report.candidate!, '.git'), 'utf8')).toBe(originalPointer)
+      else expect(existsSync(join(home, 'adopt.json'))).toBe(false)
+      expect(git(live, 'rev-parse', 'HEAD')).toBe(liveHead)
+      expect(readFileSync(join(root, 'owner-private'), 'utf8')).toBe('OWNER-PRIVATE-SENTINEL')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  },
+)

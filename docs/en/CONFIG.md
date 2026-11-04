@@ -26,7 +26,7 @@ The owner's personal style is not stored in the repository: the file lives in `D
 
 | File | Purpose | Default |
 | --- | --- | --- |
-| `DSHBOT_HOME/persona/character.md` | The owner's personal character: a non-empty file replaces the repository's neutral `persona/character.md` in the owner system prompt. An empty or missing file keeps the repository character. | the repository `persona/character.md` |
+| `DSHBOT_HOME/persona/character.md` | The owner's personal character: a non-empty file is appended after the repository's neutral `persona/character.md` in the owner system prompt and does not replace it. An empty or missing file keeps the repository character. | the repository `persona/character.md` |
 
 The file is read when the daemon starts. Restart the bot after changing the character.
 
@@ -103,6 +103,7 @@ default.
 | `DSHBOT_BROWSER_PATH` | Path to Chromium for the `browser` tool. | Chromium found in `PATH` |
 | `DSHBOT_BROWSER_IDLE_MS` | After how much idle time the browser closes. | `300000` (5 minutes) |
 | `DSHBOT_BROWSER_CDP_URL` | CDP address of an already running owner browser; only loopback is allowed. | unset (the bot starts its own Chromium) |
+| `DSHBOT_FALLBACK_MODEL` | Fallback model for owner turns and the owner's planned runs (including runs of an agent profile, which has its own model), as `provider/id` like `/model`. When the primary model fails with TRANSPORT, SERVER, TIMEOUT or STREAM_CLOSED before the first token, the turn is repeated once on it after the second failed attempt and the reply carries a note. Key, quota and rate-limit errors do not switch; the next turn uses the primary model again; guests never switch; side requests on a separate model (the aside question, document recognition, the chat column, factory role turns, child agents) stay without a fallback. The owner pays for its usage; a malformed value or an unconnected provider disables it, with one journal line giving the reason. | unset (fallback off) |
 | `DSHBOT_NOTIFY_QUEUE` | Directory of the collector card queue: the daemon takes JSON cards from it and sends them to the owner. PNG artifacts of the cards live next to it, in the sibling `artifacts/` directory; an empty value returns the queue to `DSHBOT_HOME`. | `DSHBOT_HOME/notification-queue` |
 | `DSHBOT_NOTIFY_POLL_MS` | Poll period of the collector card queue directory (`DSHBOT_NOTIFY_QUEUE`) in milliseconds: the daemon looks into the directory right after start and then with this period, and a card reaches the owner on the nearest poll. A short period, for example `200`, speeds up delivery at the cost of more frequent directory reads; tests use it. An empty value, a non-integer, zero and a negative number give the usual period. | `1000` |
 | `DSHBOT_NOTIFY_TOKEN` | Bearer token of the local HTTP intake for external events; without it the listener is disabled. | unset |
@@ -111,11 +112,33 @@ default.
 | `DSHBOT_VOICE_TEST_STUB` | Speech recognition stub directory for tests instead of the real model. | unset (the real model) |
 | `DSHBOT_VOICE_TTS_TEST_STUB` | Speech synthesis stub directory for tests instead of the real model. | unset (real synthesis) |
 
+Owner's persistent tools: `DSHBOT_HOME/tools` is created at start and mounted writable into the owner's `exec`
+sandbox (turns and scheduled tasks); the rest of `DSHBOT_HOME` and the workspace keep their previous access, and `HOME`
+stays an empty tmpfs. `uv tool` (`UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`), `pip --user` (`PYTHONUSERBASE`), `npm -g`
+(`NPM_CONFIG_PREFIX`), `cargo install` (`CARGO_INSTALL_ROOT`, `CARGO_HOME`) and `go install` (`GOBIN`) point there, and
+their caches (`UV_CACHE_DIR`, `PIP_CACHE_DIR`, `npm_config_cache`, `GOMODCACHE`, `GOCACHE`) live in `tools/cache`.
+The program directories (`tools/bin`, `tools/python/bin`, `tools/npm/bin`, `tools/cargo/bin`, `tools/go/bin`) sit in the
+sandbox `PATH` right after the daemon's node directory. Installing needs no owner approval; every command that adds
+programs leaves one line with their names in the daemon journal. The guest `exec` does not see the directory. The `tools` directories are not
+added to the `PATH` and environment of `host_exec` and the daemon, and `bwrap` and `/usr/bin/env` run by the daemon's original
+`PATH` or by absolute path, so an installed tool cannot replace the daemon's programs. Shared Python environment: when `tools/pyenv` is a ready venv (`bin/python3` and `bin/pip` exist and its real path is inside `tools`), every owner `exec` command gets `tools/pyenv/bin` first in `PATH` and `VIRTUAL_ENV` set to `tools/pyenv`, so `python3`, `pip` and `uv pip install` use it. The daemon neither creates nor changes it: the installer (`scripts/install.sh`) or the owner creates it with `python3 -m venv <DSHBOT_HOME>/tools/pyenv` (an absolute path: `exec` runs in `workspace`), and it is picked up without a daemon restart. Without `tools/pyenv`, or if it is not a venv, commands run as before. The `DSHBOT_HOME` backup does not include `tools`. System
+packages (apt) are out of scope: the sandbox has no root.
+
+### `host_exec` hosts
+
+Every local `host_exec` command, including read-only checks and machine identity checks, requires owner consent: a card or a previously granted permission for that exact host alias and command. Commands denied by the guard do not run. SSH retains its existing guard and approval policy; confined `exec` keeps its existing policy.
+
+Host aliases live in `DSHBOT_HOME/hosts.json`: a name maps to an `ssh` target (user and address) or to a local alias of this machine. The alias name is a label, not a description of the machine: `pc` may point at the owner's desktop rather than at the host the bot lives on, and the command then runs there.
+
+So the first command on an unfamiliar alias is an identity check, not a guess: `hostname; cat /etc/machine-id`, compared against the machine the bot runs on, and only then files, services and keys. Mixing up hosts is not noticed at once: user names and directories look alike, and a stray `sudo` on someone else's machine is already outside the task.
+
+`pkill -f <pattern>` over ssh also kills its own command when the pattern occurs in its command line: the shell receives the signal first and the call returns with code 255 and no output. Kill by the `pid` from `pgrep -f`, not by substring.
+
 ## Tests
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `DSHBOT_TEST_WORKERS` | Number of vitest workers instead of the computed value: a positive integer sets it explicitly, while an empty, zero, negative, fractional or non-numeric value is ignored. Without the variable a free machine gets two workers per core, and under a growing load average (`os.loadavg`) proportionally fewer, but never fewer than one. | unset (two workers per core on a free machine) |
+| `DSHBOT_TEST_WORKERS` | Vitest worker count: a positive integer. Invalid values are ignored; the default is one worker per available CPU. | unset (one worker per available CPU) |
 
 ## OpenAI-compatible API for voice clients
 
@@ -139,6 +162,10 @@ The `POST /v1/chat/completions` endpoint accepts requests from voice and other O
 | `GIT_AUTHOR_EMAIL` | Author email of these commits; the bot's commit is also recognized by it. | `dshbot@localhost` |
 | `GIT_COMMITTER_NAME` | Committer name of the bot's commits. | `dshbot` |
 | `GIT_COMMITTER_EMAIL` | Committer email of the bot's commits. | `dshbot@localhost` |
+| `GH_CONFIG_DIR` | GitHub CLI authentication directory for the trusted Superagent host broker; never passed into the sandbox. | unset (`gh` uses its standard configuration directory) |
+| `GH_TOKEN` | Current account's GitHub token for the Superagent host broker; takes precedence in `gh`, never passed into the sandbox. | unset (existing `gh` authentication is used) |
+| `GITHUB_TOKEN` | Fallback GitHub token for the Superagent host broker; never passed into the sandbox. | unset (existing `gh` authentication is used) |
+| `DSH_SUPERAGENT_NAME` | Upstream ticket name used to associate a delivery request; an explicit `ticket` field takes precedence. | unset (delivery has no ticket association) |
 
 ## Launcher and installer
 
@@ -149,6 +176,7 @@ These variables are read by `scripts/install.sh` and `scripts/dshbot-run.sh`, no
 | `DSHBOT_CONTAINER_RO` | Extra owner paths for MCP and the browser, mounted read-only in the container; a colon-separated list. | empty (only the toolchain and system directories) |
 | `DSHBOT_INSTALL_SRC` | Source directory for installation or update instead of the current repository root. | the repository root from which the installer was started |
 | `DSHBOT_INSTALL_ORIGIN` | `remote origin` address of the application instead of the source origin. | the source origin, if it exists |
+| `DSHBOT_SANDBOX_TOOLKIT` | `0` disables installing the sandbox toolkit (Python environment, npm packages, apt hint). | the toolkit is installed |
 
 ## Inherited command environment
 

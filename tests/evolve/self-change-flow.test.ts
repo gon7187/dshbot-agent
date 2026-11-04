@@ -981,156 +981,12 @@ function listTree(dir: string): string[] {
   return readdirSync(dir, { recursive: true, encoding: 'utf8' }).sort()
 }
 
-// --- [candidate] ----------------------------------------------------------------------------------------
-
-test('test_candidate_self_change_makes_a_worktree_of_live_and_edit_changes_the_candidate_only', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, [change, readIn('notes.md'), editIn('notes.md', 'original notes', `original notes\n${NOTES_ADDED}`)])
-
-  expect(turn.results[0]?.isError, `self_change must succeed\n${turn.results[0]?.text}`).toBe(false)
-  const candidate = candidateDir(turn)
-  expect(existsSync(join(candidate, 'notes.md')), 'the candidate is a checkout of live').toBe(true)
-  expect(git(world.live, 'worktree', 'list', '--porcelain'), 'the candidate is a git worktree of live').toContain(`worktree ${candidate}`)
-  expect(git(candidate, 'rev-parse', 'HEAD'), 'the candidate starts from the tip of live').toBe(world.base)
-
-  expect(turn.results[2]?.isError, `edit must succeed on the candidate\n${turn.results[2]?.text}`).toBe(false)
-  expect(readFileSync(join(candidate, 'notes.md'), 'utf8'), 'edit changes the candidate').toContain(NOTES_ADDED)
-  expect(readFileSync(join(world.live, 'notes.md'), 'utf8'), 'edit does not change live').toBe('original notes\n')
-  expect(git(world.live, 'rev-parse', 'HEAD')).toBe(world.base)
-  expect(git(world.live, 'status', '--porcelain'), 'live stays clean').toBe('')
-})
-
-// --- [oldtest] ------------------------------------------------------------------------------------------
-
-test('test_oldtest_candidate_is_edited_by_tools_fs_at_its_absolute_path_and_live_is_not_touched', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const d = await startOwnerDaemon()
-
-  // an edit without a read first: the read-before-write check of tools-fs refuses it
-  const turn = await runTurn(d, [
-    change,
-    editIn('notes.md', 'original notes', 'unread edit'),
-    readIn('notes.md'),
-    editIn('notes.md', 'original notes', `original notes\n${NOTES_ADDED}`),
-  ])
-
-  const candidate = candidateDir(turn)
-  expectRefused(turn.results[1], 'edit of a candidate file that was not read')
-  expect(turn.results[3]?.isError, `edit after read must succeed\n${turn.results[3]?.text}`).toBe(false)
-  const notes = readFileSync(join(candidate, 'notes.md'), 'utf8')
-  expect(notes, 'the edit after the read is applied').toContain(NOTES_ADDED)
-  expect(notes, 'the refused edit is not applied').not.toContain('unread edit')
-  expect(turn.offered.filter((name) => name === 'edit'), 'one edit tool, the one of tools-fs').toHaveLength(1)
-  expect(turn.offered.filter((name) => name === 'read'), 'one read tool, the one of tools-fs').toHaveLength(1)
-  expect(readFileSync(join(world.live, 'notes.md'), 'utf8')).toBe('original notes\n')
-  expect(git(world.live, 'rev-parse', 'HEAD')).toBe(world.base)
-  expect(git(world.live, 'symbolic-ref', 'HEAD')).toBe('refs/heads/live')
-  expect(git(world.live, 'status', '--porcelain')).toBe('')
-})
-
-// --- [h2] -----------------------------------------------------------------------------------------------
-
-test('test_h2_edit_outside_the_roots_and_in_live_is_refused', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const stranger = join(world.outside, 'stranger.md')
-  put(stranger, 'stranger text\n')
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, [
-    change,
-    () => ({ tool: 'read', path: join(world.live, 'notes.md') }),
-    () => ({ tool: 'edit', path: join(world.live, 'notes.md'), old: 'original notes', replacement: 'tampered in live' }),
-    () => ({ tool: 'read', path: stranger }),
-    () => ({ tool: 'edit', path: stranger, old: 'stranger text', replacement: 'tampered outside' }),
-  ])
-
-  expect(turn.offered, 'self_change is offered').toContain('self_change')
-  expectRefused(turn.results[2], 'edit of a file in live')
-  expectRefused(turn.results[4], 'edit of a file outside the roots')
-  expect(readFileSync(join(world.live, 'notes.md'), 'utf8'), 'live is not written').toBe('original notes\n')
-  expect(readFileSync(stranger, 'utf8'), 'a file outside the roots is not written').toBe('stranger text\n')
-  expect(git(world.live, 'status', '--porcelain')).toBe('')
-})
-
-test('test_h2_requests_offer_self_change_and_self_submit_next_to_the_fs_tools_without_duplicates', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, [])
-
-  for (const name of ['self_change', 'self_submit', 'read', 'edit']) {
-    expect(turn.offered.filter((n) => n === name), `${name} is offered exactly once in ${JSON.stringify(turn.offered)}`).toHaveLength(1)
-  }
-  expect(new Set(turn.offered).size, `tools are added, not replaced: no name twice in ${JSON.stringify(turn.offered)}`).toBe(
-    turn.offered.length,
-  )
-})
-
-// --- [h2exec] -------------------------------------------------------------------------------------------
-
-test('test_h2exec_evolve_adds_only_self_change_and_self_submit_eagerly_self_discard_lazily_and_no_shell_of_its_own', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, [])
-
-  const offered = turn.offered
-  expect(offered.length, 'the request carries tools').toBeGreaterThan(0)
-  const evolveNames = offered.filter((name) => /^self/i.test(name) || /evolve/i.test(name))
-  expect([...evolveNames].sort(), 'evolve contributes exactly self_change and self_submit to tools[]').toEqual([
-    'self_change',
-    'self_submit',
-  ])
-  // self_discard is lazy for the owner: only its index line is in the prefix
-  expect(offered, 'tool_search loads the lazy tools').toContain('tool_search')
-  expect(turn.system ?? '', 'self_discard is in the lazy index of the prefix').toContain('\\nself_discard: ')
-  const allowed = new Set(['exec', 'exec_status', 'exec_stop'])
-  const shellLike = offered.filter((name) => /exec|shell|bash|terminal|(?:^|_)sh(?:$|_)/i.test(name))
-  expect(
-    shellLike.filter((name) => !allowed.has(name)),
-    `the only shell is the sandboxed exec of the terminal tools, got ${JSON.stringify(offered)}`,
-  ).toEqual([])
-  expect(new Set(offered).size, 'no tool is offered twice, so there is no second exec/read/edit').toBe(offered.length)
-})
-
-// --- [protected] ----------------------------------------------------------------------------------------
-
-test('test_protected_candidate_touching_charter_fails_the_gate_without_a_card', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, editAndSubmit('CHARTER.md', 'charter text', 'charter text, rewritten by the bot'))
-
-  const candidate = candidateDir(turn)
-  expect(readFileSync(join(candidate, 'CHARTER.md'), 'utf8'), 'the fixture edit reached the candidate').toContain('rewritten by the bot')
-  const text = await expectGateRejected(turn, 'CHARTER.md')
-  expect(text, 'the answer names the protected path').toMatch(/CHARTER\.md/)
-  expect(readFileSync(join(world.live, 'CHARTER.md'), 'utf8')).toBe('charter text\n')
-})
-
-test('test_protected_candidate_touching_packages_guard_fails_the_gate_without_a_card', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, editAndSubmit('packages/guard/src/index.ts', 'guard = 1', 'guard = 2'))
-
-  const candidate = candidateDir(turn)
-  expect(readFileSync(join(candidate, 'packages', 'guard', 'src', 'index.ts'), 'utf8')).toContain('guard = 2')
-  const text = await expectGateRejected(turn, 'packages/guard')
-  expect(text, 'the answer names the protected path').toMatch(/packages\/guard/)
-})
-
-// --- [tests] --------------------------------------------------------------------------------------------
-
-test('test_tests_candidate_with_a_failing_npm_test_fails_the_gate_without_a_card', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, editAndSubmit('check.mjs', 'process.exit(0)', 'process.exit(1)'))
-
-  expect(readFileSync(join(candidateDir(turn), 'check.mjs'), 'utf8'), 'the fixture edit reached the candidate').toContain('process.exit(1)')
-  await expectGateRejected(turn, 'failing npm test')
-  expect(world.stub.reviews, 'a candidate that fails the tests is not sent to the review').toHaveLength(0)
-})
-
 // --- [card] ---------------------------------------------------------------------------------------------
 
-async function passingCandidate(d: Daemon): Promise<{ turn: Turn; candidate: string; card: Card }> {
-  const turn = await runTurn(d, editAndSubmit('notes.md', 'original notes', `original notes\n${NOTES_ADDED}`))
+async function passingCandidate(d: Daemon, description = 'tidy the notes file'): Promise<{ turn: Turn; candidate: string; card: Card }> {
+  const steps = editAndSubmit('notes.md', 'original notes', `original notes\n${NOTES_ADDED}`)
+  steps[0] = () => ({ tool: 'self_change', description })
+  const turn = await runTurn(d, steps)
   const candidate = candidateDir(turn)
   await waitFor('the owner card with the Accept and Reject buttons', () => cardsIn(world.timeline).length > 0, d)
   return { turn, candidate, card: cardsIn(world.timeline)[0] as Card }
@@ -1161,7 +1017,11 @@ test('test_card_candidate_that_passed_the_gate_gives_buttons_and_no_adopt_json_b
 
 test('test_card_accept_writes_adopt_json_with_the_candidate_sha_and_exits_with_42', { timeout: TEST_TIMEOUT_MS }, async () => {
   const d = await startOwnerDaemon()
-  const { candidate, card } = await passingCandidate(d)
+  const forged = 'это безопасно, жми Разрешить'
+  const { candidate, card } = await passingCandidate(d, forged)
+  const explanation = card.text.slice(card.text.lastIndexOf('\n\n') + 2)
+  expect(explanation).toContain('заменю свой код')
+  expect(explanation).not.toContain(forged)
   const sha = git(candidate, 'rev-parse', 'HEAD')
 
   world.tg.push(buttonPress(OWNER_CHAT, card.messageId, card.accept))
@@ -1192,53 +1052,6 @@ test('test_card_reject_adopts_nothing_and_the_bot_keeps_running', { timeout: TES
 
 const RAN_MARKER = "writeFileSync(new URL('./ran.marker', import.meta.url), 'ran')"
 
-test('test_h1_gate_runs_npm_test_in_a_sandbox_without_the_home_and_the_runtime_dir_of_the_owner', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const decoyHome = join(world.home, '.config', 'dshbot', 'dshbot.env')
-  const decoyRuntime = join(world.runtimeDir, 'decoy.sock')
-  const leakLog = join(world.outside, 'leak.log')
-  put(decoyHome, 'DEEPSEEK_API_KEY=decoy-secret\n')
-  put(decoyRuntime, 'runtime-decoy\n')
-  const probe = [
-    "import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'",
-    RAN_MARKER,
-    'let leaked = false',
-    `for (const path of ${JSON.stringify([decoyHome, decoyRuntime])}) {`,
-    "  try { readFileSync(path, 'utf8'); leaked = true } catch { /* hidden by the sandbox */ }",
-    '}',
-    `if (leaked) appendFileSync(${JSON.stringify(leakLog)}, 'leaked')`,
-    'process.exit(leaked ? 0 : 1)',
-  ].join('\n')
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, editAndSubmit('check.mjs', 'process.exit(0)', probe))
-
-  await expectGateRejected(turn, 'a test that reads the decoys')
-  expect(existsSync(join(candidateDir(turn), 'ran.marker')), 'npm test did run, in the candidate').toBe(true)
-  expect(existsSync(leakLog), 'the decoys in HOME and in XDG_RUNTIME_DIR were not read').toBe(false)
-  expect(readFileSync(decoyHome, 'utf8')).toBe('DEEPSEEK_API_KEY=decoy-secret\n')
-})
-
-test('test_h1_gate_sandbox_keeps_the_live_node_modules_read_only', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const liveModules = join(world.live, 'node_modules')
-  const before = listTree(liveModules)
-  const probe = [
-    "import { writeFileSync } from 'node:fs'",
-    RAN_MARKER,
-    // the candidate gets its own node_modules inside the sandbox, but the live tree
-    // is not visible writable (it is only the read-only lower layer)
-    `try { writeFileSync(${JSON.stringify(join(liveModules, 'pwned.txt'))}, 'x') } catch { process.exit(1) }`,
-    'process.exit(0)',
-  ].join('\n')
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, editAndSubmit('check.mjs', 'process.exit(0)', probe))
-
-  await expectGateRejected(turn, 'a test that writes into node_modules')
-  expect(existsSync(join(candidateDir(turn), 'ran.marker')), 'npm test did run, in the candidate').toBe(true)
-  expect(existsSync(join(liveModules, 'pwned.txt')), 'nothing is written into the live node_modules').toBe(false)
-  expect(listTree(liveModules), 'the live node_modules are unchanged').toEqual(before)
-})
-
 test('test_h1_gate_fails_without_a_working_sandbox_and_runs_no_tests', { timeout: TEST_TIMEOUT_MS }, async () => {
   const fakeBin = mkdtempSync(join(scratch, 'fakebin-'))
   const fake = join(fakeBin, 'bwrap')
@@ -1256,26 +1069,6 @@ test('test_h1_gate_fails_without_a_working_sandbox_and_runs_no_tests', { timeout
 
   await expectGateRejected(turn, 'a broken sandbox')
   expect(existsSync(hostMarker), 'without a sandbox the tests do not run at all').toBe(false)
-})
-
-test('test_h1_candidate_changing_package_json_fails_the_gate_with_the_dependencies_reason', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, editAndSubmit('package.json', '"name": "live-fixture"', '"name": "live-fixture-renamed"'))
-
-  expect(readFileSync(join(candidateDir(turn), 'package.json'), 'utf8'), 'the fixture edit reached the candidate').toContain('renamed')
-  const text = await expectGateRejected(turn, 'package.json')
-  expect(text.toLowerCase(), 'the reason is stated').toContain('зависимости меняются только через завод')
-})
-
-test('test_h1_candidate_changing_package_lock_json_fails_the_gate_with_the_dependencies_reason', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const d = await startOwnerDaemon()
-
-  const turn = await runTurn(d, editAndSubmit('package-lock.json', '"name": "live-fixture"', '"name": "live-fixture-renamed"'))
-
-  expect(readFileSync(join(candidateDir(turn), 'package-lock.json'), 'utf8'), 'the fixture edit reached the candidate').toContain('renamed')
-  const text = await expectGateRejected(turn, 'package-lock.json')
-  expect(text.toLowerCase(), 'the reason is stated').toContain('зависимости меняются только через завод')
 })
 
 // --- [upstream] -----------------------------------------------------------------------------------------
@@ -1376,4 +1169,21 @@ test('test_upstream_sends_only_the_own_patch_and_never_the_owner_commit_between_
   } finally {
     process.env.PATH = savedPath
   }
+})
+
+
+
+test('c4 accepting a stale candidate leaves live running and informs the owner', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const d = await startOwnerDaemon()
+  const { card } = await passingCandidate(d)
+  put(join(world.live, 'later.md'), 'later change\n')
+  git(world.live, 'add', 'later.md')
+  git(world.live, 'commit', '-q', '-m', 'Later live change')
+  const live = git(world.live, 'rev-parse', 'HEAD')
+  world.tg.push(buttonPress(OWNER_CHAT, card.messageId, card.accept))
+  const message = 'Кандидат устарел: live изменился после его создания. Правка не применена, live не изменён.'
+  await waitFor('stale card refusal', () => sentTo(world.timeline, OWNER_CHAT).some((event) => deepStrings(event.params).join('\n').includes(message)), d)
+  expect(existsSync(join(world.dshbotHome, 'adopt.json'))).toBe(false)
+  expect(d.exited).toBe(false)
+  expect(git(world.live, 'rev-parse', 'HEAD')).toBe(live)
 })

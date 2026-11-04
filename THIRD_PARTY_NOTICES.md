@@ -1,6 +1,6 @@
 # Third-party notices
 
-DSHBOT borrows prompt wording and behavioural rules from four MIT-licensed
+DSHBOT borrows code, prompt wording and behavioural rules from MIT-licensed
 projects and runs on DeepSeek Harness, which is also MIT-licensed. The texts
 below are the required copyright notices; the MIT licence that covers the
 borrowed material follows them. A separate section lists the transitive
@@ -14,6 +14,19 @@ Source: DeepSeek Harness (`@deepseek-ai/dsh-*`, `@deepseek-ai/cordis`). Licence:
 MIT. DSHBOT uses the harness as its agent runtime: the agent loop, sessions,
 DeepSeek provider, tool seam, sandbox and subagents are loaded from the pinned
 `@deepseek-ai/dsh-*` packages.
+
+## DeepSeek Superagent prototype
+
+Copyright (c) 2026 DeepSeek Harness Team
+
+Source: https://github.com/deepseek-ai/dsh-superagent-prototype, commit
+`6337fc823ce20251c8de8085948165c81aaa701e`. The domain engine in
+`packages/superagent/src/core` is vendored under MIT, with local import
+extensions and constructor fields adapted for Node's TypeScript loader. The original copyright and licence are in
+`packages/superagent/LICENSE.upstream`; provenance is in `packages/superagent/UPSTREAM.md`.
+The optional full runtime packages the same pinned upstream, including its
+MIT license, with a documented startup wrapper overlay. Assembly and dependency provenance are
+documented in `integrations/superagent/UPSTREAM.md`.
 
 ## OpenClaw
 

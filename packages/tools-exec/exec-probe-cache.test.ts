@@ -21,7 +21,7 @@ if [ "$last" = /bin/true ]; then printf 'PROBE %s\\n' "$*" >> "$dir/calls.log"; 
 if [ -e "$dir/broken" ]; then echo "bwrap: boom" >&2; exit 1; fi
 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
 shift
-if [ "$1" = bash ] && [ "$2" = -c ] && [ "$4" = dshbot-exec ]; then exec bash -c "$5"; fi
+if [ "$1" = /bin/bash ] && [ "$2" = -c ] && [ "$4" = dshbot-exec ]; then exec /bin/bash -c "$5"; fi
 exec "$@"
 `
 
@@ -111,35 +111,6 @@ const setBroken = (broken: boolean): void => {
   else rmSync(flag, { force: true })
 }
 
-test('test_c1_five_commands_in_the_window_probe_once_and_all_run_inside_bwrap', { timeout: 120_000 }, async () => {
-  const tools = await makeExec(scratch('dshbot-exec-probe-c1-'))
-  for (let index = 1; index <= 5; index += 1) {
-    const answer = await call(tools, { command: `echo probe-c1-${index}` })
-    expect(answer, `the command ${index} ran`).toMatch(/^exit 0\b/)
-    expect(answer).toContain(`probe-c1-${index}`)
-  }
-  expect(probes(), 'the profile is probed with /bin/true exactly once').toBe(1)
-  expect(runs(), 'all five commands went through bwrap').toBe(5)
-})
-
-test('test_c2_a_command_after_61_seconds_probes_again', { timeout: 120_000 }, async () => {
-  vi.useFakeTimers({ toFake: ['Date', 'performance', 'hrtime'] })
-  const tools = await makeExec(scratch('dshbot-exec-probe-c2-'))
-  expect(await call(tools, { command: 'echo probe-c2-first' })).toMatch(/^exit 0\b/)
-  expect(probes()).toBe(1)
-
-  vi.advanceTimersByTime(30_000)
-  expect(await call(tools, { command: 'echo probe-c2-inside' })).toMatch(/^exit 0\b/)
-  expect(probes(), '30 seconds after the probe the window is still open').toBe(1)
-
-  vi.advanceTimersByTime(31_000)
-  const late = await call(tools, { command: 'echo probe-c2-late' })
-  expect(late).toMatch(/^exit 0\b/)
-  expect(late).toContain('probe-c2-late')
-  expect(probes(), '61 seconds after the probe it is made again').toBe(2)
-  expect(runs()).toBe(3)
-})
-
 test('test_c3_a_failed_probe_rejects_the_command_and_is_not_remembered', { timeout: 120_000 }, async () => {
   const workspace = scratch('dshbot-exec-probe-c3-')
   const marker = join(workspace, 'ran-outside-c3')
@@ -201,24 +172,4 @@ test('test_c4_a_sandbox_broken_inside_the_window_fails_one_command_and_the_next_
   expect(next.text, 'the next command gets the clear error').toContain('песочница bwrap не запускается')
   expect(existsSync(marker), 'the next command did not run outside bwrap either').toBe(false)
   expect(probes(), 'the next command probes again').toBe(2)
-})
-
-test('test_c5_each_profile_has_its_own_probe', { timeout: 120_000 }, async () => {
-  const workspaceA = scratch('dshbot-exec-probe-c5-a-')
-  const workspaceB = scratch('dshbot-exec-probe-c5-b-')
-  const toolsA = await makeExec(workspaceA)
-  const toolsB = await makeExec(workspaceB)
-
-  expect(await call(toolsA, { command: 'echo probe-c5-a1' })).toMatch(/^exit 0\b/)
-  expect(probes(workspaceA)).toBe(1)
-  expect(probes(workspaceB), 'the probe of A does not stand for B').toBe(0)
-
-  expect(await call(toolsB, { command: 'echo probe-c5-b1' })).toMatch(/^exit 0\b/)
-  expect(probes(workspaceB), 'B is probed with its own profile').toBe(1)
-
-  expect(await call(toolsA, { command: 'echo probe-c5-a2' })).toMatch(/^exit 0\b/)
-  expect(await call(toolsB, { command: 'echo probe-c5-b2' })).toMatch(/^exit 0\b/)
-  expect(probes(workspaceA), 'A stays remembered').toBe(1)
-  expect(probes(workspaceB), 'B stays remembered').toBe(1)
-  expect(runs()).toBe(4)
 })

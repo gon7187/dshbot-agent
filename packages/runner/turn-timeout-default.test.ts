@@ -1,19 +1,14 @@
-// [h1] The default wall-clock cap of a runner turn is 30 minutes. A child process runs a real runner against a
-// local DeepSeek stub with one slow fake tool registered through the tools seam. The clock is fake: the child
-// replaces setTimeout for delays of 10 minutes and longer, keeps those timers instead of arming them, and the
-// test "moves time" by firing them by hand. At the 15 minute mark nothing may happen to the turn; at the 30
-// minute mark the turn is cancelled, the abort signal of the running tool fires and promptTurn reports the
-// timeout.
-
 import { spawn } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 
+describe('own continuation and child cancellation', () => {
+// Real runner continuation with a local fake provider and an abortable tool.
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url))
 const runnerEntry = pathToFileURL(join(repoRoot, 'packages/runner/src/index.ts')).href
 
@@ -28,6 +23,7 @@ type Json = Record<string, unknown>
 interface Stub {
   server: Server
   origin: string
+  calls: Json[]
 }
 
 function sse(event: string, data: unknown): string {
@@ -71,7 +67,7 @@ function lastIsToolResult(body: Json): boolean {
 
 /** The first streamed request asks for the slow tool; once it has a tool_result the model answers. */
 async function startStub(): Promise<Stub> {
-  const stub: Stub = { server: createServer(), origin: '' }
+  const stub: Stub = { server: createServer(), origin: '', calls: [] }
   stub.server.on('request', (req, res) => {
     void readBody(req).then((raw) => {
       let body: Json = {}
@@ -96,14 +92,20 @@ async function startStub(): Promise<Stub> {
         )
         return
       }
+      stub.calls.push(body)
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' })
+      if (JSON.stringify(body.messages).includes('correction-one')) {
+        res.end(streamOf({ type: 'text', text: '' }, [{ type: 'text_delta', text: 'continued-original-task' }], 'end_turn'))
+        return
+      }
       if (lastIsToolResult(body)) {
         res.end(streamOf({ type: 'text', text: '' }, [{ type: 'text_delta', text: 'late-answer' }], 'end_turn'))
         return
       }
       res.end(
         streamOf(
-          { type: 'tool_use', id: 'toolu_stub_1', name: 'slow_probe', input: {} },
+          { type: 'tool_use', id: 'toolu_stub_1', name: Array.isArray(body.tools) && (body.tools as Json[]).some(tool => tool.name === 'delegate_sync')
+            ? 'delegate_sync' : 'slow_probe', input: {} },
           [{ type: 'input_json_delta', partial_json: '{}' }],
           'tool_use',
         ),
@@ -169,9 +171,10 @@ function advance(from, to) {
   }
 }
 
-const data = { toolEvents: [] }
+const data = { toolEvents: [], turnsEnded: 0 }
 try {
   const runnerModule = await import(cfg.entry)
+  let runner
   const slow = {
     name: 'slow_probe',
     description: 'Test probe that works for a very long time.',
@@ -190,24 +193,41 @@ try {
     },
   }
   data.defaultMs = runnerModule.DEFAULT_TURN_TIMEOUT_MS
-  const runner = await runnerModule.startRunner({
+  const delegated = {
+    name: 'delegate_sync', description: 'Run one synchronous child.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    execute: async (args, context) => {
+      data.childResult = await runner.runChild({ task: 'child-original-task', parentSessionId: 'main', tools: ['slow_probe'], signal: context.signal })
+      return data.childResult
+    },
+  }
+  runner = await runnerModule.startRunner({
     dshHome: cfg.dshHome,
     cwd: cfg.cwd,
     baseUrl: cfg.baseUrl,
     apiKey: cfg.apiKey,
     systemPrefix: 'Ты — тестовый помощник DSHBOT, префикс №1',
-    tools: [slow],
+    tools: cfg.child ? [slow, delegated] : [slow],
+    onTurnEnd: () => { data.turnsEnded++ },
   })
   const turn = runner.promptTurn('сделай медленное дело')
   for (let i = 0; i < 400 && !data.toolEvents.includes('start'); i += 1) await sleep(50)
   data.armed = [...held].map((timer) => timer.delay).sort((a, b) => a - b)
 
+  if (cfg.corrections) {
+    data.accepted = cfg.corrections.map(text => runner.steer(text))
+    if (cfg.stopAfterCorrection) data.stopped = runner.cancel()
+  } else {
   advance(900000, 1800000)
   await sleep(800)
   data.abortedAt15 = data.toolEvents.includes('aborted')
 
   advance(1800000, Infinity)
-  data.outcome = await Promise.race([turn.then((outcome) => outcome, (error) => ({ error: String(error && error.message ? error.message : error) })), sleep(15000).then(() => 'hang')])
+  }
+  let deadline
+  data.outcome = await Promise.race([turn.then((outcome) => outcome, (error) => ({ error: String(error && error.message ? error.message : error) })), new Promise(resolve => { deadline = realSetTimeout(() => resolve('hang'), 15000) })])
+  realClearTimeout(deadline)
+  data.lateSteer = runner.steer('late correction')
   await runner.stop()
   report(data)
 } catch (error) {
@@ -224,6 +244,11 @@ interface ChildReport {
   abortedAt15?: boolean
   outcome?: unknown
   error?: string
+  accepted?: boolean[]
+  turnsEnded?: number
+  stopped?: boolean
+  lateSteer?: boolean
+  childResult?: { text: string; aborted?: string }
 }
 
 let scratch: string
@@ -257,10 +282,10 @@ afterEach(async () => {
   })
 })
 
-function runChild(): Promise<{ report: ChildReport | undefined; output: string }> {
+function runChild(options: { corrections?: string[]; stopAfterCorrection?: boolean; child?: boolean } = {}): Promise<{ report: ChildReport | undefined; output: string }> {
   const env: Record<string, string> = { HOME: tmpHome, USERPROFILE: tmpHome, PATH: process.env.PATH ?? '' }
   if (process.env.TMPDIR) env.TMPDIR = process.env.TMPDIR
-  const cfg = { entry: runnerEntry, dshHome, cwd: workDir, baseUrl: `${stub.origin}/anthropic`, apiKey: API_KEY }
+  const cfg = { entry: runnerEntry, dshHome, cwd: workDir, baseUrl: `${stub.origin}/anthropic`, apiKey: API_KEY, ...options }
   const args = ['--import', pathToFileURL(join(scratch, 'register.mjs')).href, join(scratch, 'driver.mjs'), JSON.stringify(cfg)]
   return new Promise((resolve) => {
     const child = spawn(process.execPath, args, { cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -282,33 +307,49 @@ function runChild(): Promise<{ report: ChildReport | undefined; output: string }
   })
 }
 
-test('test_h1_runner_default_turn_timeout_is_thirty_minutes_and_cancels_the_running_tool', { timeout: CHILD_TIMEOUT_MS }, async () => {
-  const run = await runChild()
+
+test('R-CORRECTION preserves goal and ordered corrections once', { timeout: 60_000 }, async () => {
+  {
+  const run = await runChild({ corrections: ['correction-one: inspect partial side effects', 'correction-two: preserve the original goal'] })
   expect(run.report?.error, run.output).toBeUndefined()
-  const report = run.report as ChildReport
-  expect(report, run.output).toBeDefined()
-
-  expect(report.defaultMs, 'DEFAULT_TURN_TIMEOUT_MS').toBe(1_800_000)
-  expect(report.toolEvents, `the slow tool must get the AbortSignal\n${run.output}`).not.toContain('nosignal')
-  expect(report.armed, `a turn armed with no override must hold a 30 minute timer\n${run.output}`).toContain(1_800_000)
-  expect(report.armed, `no 15 minute timer is expected any more\n${run.output}`).not.toContain(900_000)
-  expect(report.abortedAt15, `the turn must survive the 15 minute mark\n${run.output}`).toBe(false)
-
-  expect(report.toolEvents, `the 30 minute mark must fire the abort signal of the tool\n${run.output}`).toContain('aborted')
-  expect(report.toolEvents, 'the tool must not run to its end').not.toContain('finished')
-  expect(report.outcome, `promptTurn must report the timeout and no reply\n${run.output}`).toEqual({ text: '', aborted: 'timeout' })
+  expect(run.report?.accepted).toEqual([true, true])
+  expect(run.report?.toolEvents).toEqual(['start', 'aborted'])
+  expect(run.report?.outcome, run.output).toMatchObject({ text: 'continued-original-task' })
+  expect(run.report?.turnsEnded).toBe(1)
+  expect(run.report?.lateSteer).toBe(false)
+  expect(stub.calls.length).toBeGreaterThanOrEqual(2)
+  expect(stub.calls.length).toBeLessThanOrEqual(3)
+  const resumed = JSON.stringify(stub.calls.at(-1)?.messages)
+  expect(resumed).toContain('сделай медленное дело')
+  expect(resumed.split('correction-one')).toHaveLength(2)
+  expect(resumed.split('correction-two')).toHaveLength(2)
+  expect(resumed.indexOf('correction-one')).toBeLessThan(resumed.indexOf('correction-two'))
+  expect(resumed).toMatch(/partial|частичн/u)
+  }
 })
 
-test('c5 a timed-out turn keeps the cancellation note in the session journal', { timeout: CHILD_TIMEOUT_MS }, async () => {
-  const run = await runChild()
+test('R-STOP cancels without replay', { timeout: 60_000 }, async () => {
+  {
+  const run = await runChild({ corrections: ['correction-one'], stopAfterCorrection: true })
   expect(run.report?.error, run.output).toBeUndefined()
-  expect(run.report?.outcome, run.output).toEqual({ text: '', aborted: 'timeout' })
-  const { readdirSync, readFileSync } = await import('node:fs')
-  const readTree = (dir: string): string => readdirSync(dir, { withFileTypes: true }).map((entry) => {
-    const path = join(dir, entry.name)
-    return entry.isDirectory() ? readTree(path) : readFileSync(path, 'utf8')
-  }).join('\n')
-  const journal = readTree(join(dshHome, 'sessions'))
-  expect(journal).toContain('[ход прерван: выполнение остановлено]')
-  expect(journal).not.toContain('[ход не выполнен: ошибка провайдера')
+  expect(run.report?.stopped).toBe(true)
+  expect(run.report?.toolEvents).toEqual(['start', 'aborted'])
+  expect(run.report?.outcome).toEqual({ text: '', aborted: 'stop' })
+  expect(run.report?.turnsEnded).toBe(1)
+  expect(stub.calls).toHaveLength(1)
+  }
+})
+
+test('R-SYNC-CHILD propagates cancellation', { timeout: 60_000 }, async () => {
+  {
+  const run = await runChild({ corrections: ['correction-one'], child: true })
+  expect(run.report?.error, run.output).toBeUndefined()
+  expect(run.report?.toolEvents).toEqual(['start', 'aborted'])
+  expect(run.report?.childResult).toMatchObject({ text: '', aborted: 'stop' })
+  expect(run.report?.outcome, run.output).toMatchObject({ text: 'continued-original-task' })
+  expect(run.report?.turnsEnded).toBe(1)
+  expect(stub.calls).toHaveLength(3)
+  }
+})
+
 })

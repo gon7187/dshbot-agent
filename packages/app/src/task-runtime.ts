@@ -212,36 +212,34 @@ export function createTaskRuntime(deps: TaskRuntimeDeps): TaskRuntime {
   const taskTool: RunnerTool = {
     name: 'task',
     description:
-      'Поставить, посмотреть или отменить автономную задачу. create: goal, acceptance (shell-команда или ' +
-      'решает судья), constraints, project, origin. Задача идёт в своей сессии и закрывается только ' +
-      'проверкой приёмки и судьёй. Обещание «сделаю позже» без созданной задачи или расписания не принимается.',
+      'Autonomous task: create, list, status, cancel. Runs in its own session, closed only by the ' +
+      'acceptance check and the judge. A promise to do it later without a task or schedule is not accepted.',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
           enum: ['create', 'list', 'status', 'cancel'],
-          description: 'Что сделать с задачами.',
+          description: 'Action.',
         },
-        goal: { type: 'string', description: 'Результат задачи, который нужно получить.' },
+        goal: { type: 'string', description: 'Wanted result.' },
         acceptance: {
           type: 'object',
-          description:
-            'Критерий приёмки: shell-проверка (kind=shell, command) или kind=judge, когда решает судья.',
+          description: 'kind=shell with command, or kind=judge (the judge decides).',
           properties: {
             kind: { type: 'string', enum: ['shell', 'judge'] },
-            command: { type: 'string', description: 'Shell-команда проверки; 0 — успех.' },
+            command: { type: 'string', description: 'Check; exit 0 is success.' },
           },
           required: ['kind'],
         },
-        constraints: { type: 'string', description: 'Ограничения задачи.' },
-        project: { type: 'string', description: 'Проект; задачи одного проекта идут по одной.' },
+        constraints: { type: 'string', description: 'Constraints.' },
+        project: { type: 'string', description: 'Project; its tasks run one at a time.' },
         origin: {
           type: 'string',
           enum: ['owner', 'schedule', 'self'],
-          description: 'Кто поставил задачу.',
+          description: 'Who set it.',
         },
-        id: { type: 'string', description: 'Id задачи для status или cancel.' },
+        id: { type: 'string', description: 'For status and cancel.' },
       },
       required: ['action'],
     },

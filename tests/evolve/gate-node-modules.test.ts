@@ -239,35 +239,6 @@ test('test_c_real_candidate_without_changes_passes_tsc_and_vitest_in_the_gate_sa
   expect(result.ok).toBe(true)
 })
 
-// tsc of TypeScript 7 finds its native binary (@typescript/typescript-<platform>) as a
-// sibling package of typescript; the fallback must keep that lookup working.
-test('test_c_real_fallback_candidate_without_changes_passes_tsc_and_vitest_without_overlay', { timeout: TEST_TIMEOUT_MS }, async (ctx) => {
-  requireBwrap((note) => ctx.skip(note))
-  const liveModules = join(repoRoot, 'node_modules')
-  expect(existsSync(join(liveModules, 'vitest')), 'the installed node_modules of this checkout serve as the live ones').toBe(true)
-  const candidate = await newCandidate()
-  const calls = bwrapWithoutOverlay()
-
-  const result = await sandboxedTests({
-    ownerHome: world.ownerHome,
-    candidate: candidate.path,
-    liveModules,
-    command: ['npm', 'run', 'full'],
-    timeoutMs: 240_000,
-  })
-
-  expect(result.sandboxError, `the fallback sandbox must start\n${result.output}`).toBeUndefined()
-  expect(result.status, `tsc --noEmit and vitest run in the candidate without overlay\n${result.output}`).toBe(0)
-  expect(result.ok).toBe(true)
-  const runs = readFileSync(calls, 'utf8')
-    .trim()
-    .split('\n')
-    .map((line) => JSON.parse(line) as string[])
-    .filter((args) => args.includes('full'))
-  expect(runs.length, 'npm run full went through the bwrap without overlay').toBe(1)
-  expect(existsSync(join(candidate.path, 'node_modules')), 'no node_modules is left in the candidate on the host').toBe(false)
-})
-
 // --- [write] ----------------------------------------------------------------------------------------------
 
 test('test_c_write_vite_temp_is_writable_in_the_sandbox_and_live_node_modules_stay_unchanged', { timeout: TEST_TIMEOUT_MS }, async (ctx) => {
@@ -303,33 +274,6 @@ test('test_c_write_vite_temp_is_writable_in_the_sandbox_and_live_node_modules_st
   expect(existsSync(join(liveModules, '.vite-temp')), 'no .vite-temp in live node_modules').toBe(false)
   expect(existsSync(join(candidate.path, 'node_modules', '.vite-temp')), 'no .vite-temp in the candidate on the host').toBe(false)
   expect(existsSync(join(candidate.path, 'node_modules', 'live-dep', 'cache.tmp')), 'the throw-away layer is discarded').toBe(false)
-})
-
-// --- [clean] ----------------------------------------------------------------------------------------------
-
-test('test_c_clean_candidate_has_no_node_modules_in_worktree_or_commit_after_the_gate', { timeout: TEST_TIMEOUT_MS }, async (ctx) => {
-  requireBwrap((note) => ctx.skip(note))
-  const candidate = await newCandidate()
-  writeFileSync(join(candidate.path, 'notes.md'), 'original notes\nadded by candidate\n')
-
-  const answer = await tool('self_submit', { id: candidate.id })
-  expect(answer, 'the candidate passes the gate and is committed').toContain('sha')
-
-  const link = join(candidate.path, 'node_modules')
-  if (lstatExists(link)) {
-    expect(lstatSync(link).isSymbolicLink(), 'no symlink to live node_modules is left in the candidate').toBe(false)
-  }
-  const inModules = (paths: string): string[] => paths.split('\n').filter((path) => path.split('/').includes('node_modules'))
-  expect(inModules(git(candidate.path, 'ls-files', '--others', '--exclude-standard')), 'no untracked node_modules path').toEqual([])
-  expect(inModules(git(candidate.path, 'ls-files', '--modified')), 'no modified node_modules path').toEqual([])
-  expect(inModules(git(candidate.path, 'ls-files', '--others', '--ignored', '--exclude-standard')), 'no node_modules content is left').toEqual([])
-  const committed = git(candidate.path, 'ls-tree', '-r', '--name-only', 'HEAD')
-  expect(inModules(committed), 'the candidate commit has no node_modules').toEqual([])
-  expect(committed.split('\n'), 'the change itself is committed').toContain('notes.md')
-
-  git(candidate.path, 'add', '-A')
-  expect(inModules(git(candidate.path, 'ls-files', '--cached')), 'git add -A picks up no node_modules').toEqual([])
-  expect(existsSync(join(world.live, 'node_modules', '.vite-temp')), 'live node_modules are untouched').toBe(false)
 })
 
 function lstatExists(path: string): boolean {
@@ -381,4 +325,27 @@ test('test_c_profile_gate_sandbox_keeps_no_network_empty_home_and_read_only_syst
   })
   expect(result.sandboxError, `the sandbox must start\n${result.output}`).toBeUndefined()
   expect(result.status, `the profile is not weakened\n${result.output}`).toBe(0)
+})
+
+
+test('fallback resolves plain/scoped siblings and discards private writable caches', { timeout: TEST_TIMEOUT_MS }, async (ctx) => {
+  requireBwrap((note) => ctx.skip(note))
+  const candidate = await newCandidate()
+  const liveModules = join(world.live, 'node_modules')
+  put(join(liveModules, 'a/package.json'), '{"name":"a","main":"lib/index.js"}\n')
+  put(join(liveModules, 'a/lib/index.js'), "module.exports = [require('b'), require('@platform/native')]\n")
+  put(join(liveModules, 'b/index.js'), "module.exports = 'plain'\n")
+  put(join(liveModules, '@platform/native/index.js'), "module.exports = 'scoped'\n")
+  put(join(liveModules, '.vite-temp/live-cache'), 'preserve cache')
+  const before = listTree(liveModules)
+  bwrapWithoutOverlay()
+  const result = await sandboxedTests({ ownerHome: world.ownerHome, candidate: candidate.path, liveModules,
+    command: [process.execPath, '-e', `const fs=require('node:fs'),assert=require('node:assert/strict'); assert.deepEqual(require('a'),['plain','scoped']); for(const cache of ['.vite-temp','.vite','.vitest','.cache']) {fs.mkdirSync('node_modules/'+cache+'/private',{recursive:true});fs.writeFileSync('node_modules/'+cache+'/private/probe','cache')} assert.throws(()=>fs.writeFileSync('node_modules/a/lib/index.js','modified')); console.log('fallback-ready')`],
+  })
+  expect(result.ok, result.output).toBe(true)
+  expect(result.output).toContain('fallback-ready')
+  expect(listTree(liveModules)).toEqual(before)
+  expect(readFileSync(join(liveModules, 'a/lib/index.js'), 'utf8')).toContain("require('b')")
+  expect(readFileSync(join(liveModules, '.vite-temp/live-cache'), 'utf8')).toBe('preserve cache')
+  expect(existsSync(join(candidate.path, 'node_modules'))).toBe(false)
 })

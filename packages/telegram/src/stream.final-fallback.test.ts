@@ -1,178 +1,88 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
-import { TelegramApiError } from './api.js'
-import type { TelegramApi } from './api.js'
-import * as streamModule from './stream.js'
+import { TelegramApiError, type TelegramApi } from './api.js'
+import { createReplyStream } from './stream.js'
+import { sendFormatted } from './rich/index.js'
 
 const CHAT = 2002
 const THREAD = 91
-const PREVIEW_ID = 55
-
 type Params = Record<string, unknown>
-interface Call {
-  method: string
-  params: Params
-}
-
-interface Stream {
-  update(markdown: string): unknown
-  finish(markdown: string): unknown
-  abort(): unknown
-  onStopped(draftId: number): unknown
-}
-
-const createReplyStream = streamModule.createReplyStream as unknown as (options: Params) => Stream
-
-const FINAL_MD = 'Итоговый **ответ** про zebra\n\n- first-item\n- second-item'
-const FINAL_WORDS = ['ответ', 'zebra', 'first-item', 'second-item']
-
-// Первый sendMessage отдаёт PREVIEW_ID (превью в режиме edit), следующие — другие id,
-// чтобы финальные сообщения не путались с превью.
-function fakeApi(failing: string[]) {
+interface Call { method: string; params: Params; rejected: boolean }
+function fakeApi(reject: (method: string, params: Params, nth: number) => string | undefined = () => undefined) {
   const calls: Call[] = []
-  let nextMessageId = PREVIEW_ID
-  const api: TelegramApi = {
-    async call<T = unknown>(method: string, params: Params = {}): Promise<T> {
-      calls.push({ method, params })
-      if (failing.includes(method)) throw new TelegramApiError(method, 400, 'Bad Request: not supported in this chat')
-      if (method === 'sendMessage') {
-        const id = nextMessageId
-        nextMessageId = id === PREVIEW_ID ? 700 : id + 1
-        return { message_id: id } as T
-      }
-      if (method === 'sendRichMessage') return { message_id: 600 } as T
-      return true as T
-    },
-  }
+  const counts = new Map<string, number>()
+  const api: TelegramApi = { async call<T>(method: string, params: Params = {}): Promise<T> {
+    const nth = (counts.get(method) ?? 0) + 1
+    counts.set(method, nth)
+    const reason = reject(method, params, nth)
+    calls.push({ method, params, rejected: reason !== undefined })
+    if (reason !== undefined) throw new TelegramApiError(method, 400, reason)
+    return { message_id: 100 + calls.length } as T
+  } }
   return { api, calls }
 }
-
-function plainText(value: unknown): string {
-  return String(value ?? '')
-    .replace(/<[^>]*>/g, '')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
+function payload(calls: Call[]): string {
+  return calls.filter(c => !c.rejected && ['sendRichMessage', 'sendMessage'].includes(c.method))
+    .map(c => c.method === 'sendRichMessage' ? String((c.params.rich_message as Params).markdown) : String(c.params.text)).join('\n')
 }
+beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date('2026-01-01T00:00:00Z')) })
+afterEach(() => vi.useRealTimers())
 
-async function runFinish(stream: Stream, markdown: string): Promise<unknown> {
-  return Promise.resolve(stream.finish(markdown)).then(
-    () => undefined,
-    (error: unknown) => error ?? new Error('finish rejected'),
-  )
-}
-
-function hasStopButton(markup: unknown): boolean {
-  if (!markup || typeof markup !== 'object') return false
-  const rows = (markup as { inline_keyboard?: unknown }).inline_keyboard
-  return Array.isArray(rows) && rows.flat().length > 0
-}
-
-beforeEach(() => {
-  vi.useFakeTimers()
-  vi.setSystemTime(new Date('2026-01-01T00:00:00Z'))
-})
-
-afterEach(() => {
-  vi.useRealTimers()
-})
-
-test('test_h1_final_rich_400_still_delivers_whole_text_via_send_message_with_thread_id', async () => {
-  const { api, calls } = fakeApi(['sendRichMessage'])
+test('F1 rich and HTML rejection after an earlier part conserves ordered payload and thread', async () => {
+  const { api, calls } = fakeApi((method, params, nth) =>
+    method === 'sendRichMessage' && nth === 2 ? 'Bad Request: rich message is invalid' :
+    method === 'sendMessage' && params.parse_mode === 'HTML' && nth === 2 ? "Bad Request: can't parse entities" : undefined)
   const stream = createReplyStream({ api, chatId: CHAT, threadId: THREAD })
+  const text = Array.from({ length: 1200 }, (_, i) => `- ITEM-${i}-end`).join('\n')
+  await stream.finish(text)
+  expect(calls.some(c => c.rejected && c.method === 'sendRichMessage')).toBe(true)
+  expect(calls.some(c => c.rejected && c.params.parse_mode === 'HTML')).toBe(true)
+  expect([...payload(calls).matchAll(/ITEM-(\d+)-end/g)].map(m => Number(m[1]))).toEqual(Array.from({ length: 1200 }, (_, i) => i))
+  for (const call of calls) expect(call.params.message_thread_id).toBe(THREAD)
+})
 
-  await stream.update('черновик')
+test('F2 keyboard rejection retries unsent part only; missing thread never retries elsewhere', async () => {
+  const { api, calls } = fakeApi((_method, params) => params.reply_markup ? 'Bad Request: BUTTON_COPY_TEXT_INVALID' : undefined)
+  const text = Array.from({ length: 3 }, (_, i) => `PART-${i} ${'word '.repeat(30)}`).join('\n\n')
+  await sendFormatted(api, CHAT, text, { maxChars: 250, threadId: THREAD, replyMarkup: { inline_keyboard: [[{ text: 'Copy', copy_text: { text: 'x' } }]] } })
+  expect(calls.some(c => c.rejected)).toBe(true)
+  expect([...payload(calls).matchAll(/PART-(\d+)/g)].map(m => Number(m[1]))).toEqual([0, 1, 2])
+  const missing = fakeApi(() => 'Bad Request: message thread not found')
+  await expect(sendFormatted(missing.api, CHAT, 'thread payload', { threadId: THREAD })).rejects.toThrow(/thread/i)
+  expect(missing.calls).toHaveLength(2)
+  for (const call of missing.calls) expect(call.params.message_thread_id).toBe(THREAD)
+})
+
+test('F3 foreign stop ignored, own stop fires once; finish and abort remove keyboard and cancel drafts', async () => {
+  const { api, calls } = fakeApi()
+  const onStop = vi.fn()
+  const stream = createReplyStream({ api, chatId: CHAT, onStop })
+  await stream.update('draft')
   await vi.advanceTimersByTimeAsync(0)
-  const before = calls.length
-  const failure = await runFinish(stream, FINAL_MD)
+  const draftId = calls.find(c => c.method === 'sendRichMessageDraft')?.params.draft_id as number
+  await stream.onStopped(draftId + 1)
+  expect(onStop).not.toHaveBeenCalled()
+  await stream.onStopped(draftId)
+  await stream.onStopped(draftId)
+  expect(onStop).toHaveBeenCalledOnce()
+  await stream.finish('final payload')
+  const finalCount = calls.length
+  await vi.advanceTimersByTimeAsync(60_000)
+  expect(calls).toHaveLength(finalCount)
 
-  const sent = calls.slice(before).filter((c) => c.method === 'sendMessage')
-  expect(sent.length).toBeGreaterThanOrEqual(1)
-  const delivered = sent.map((c) => plainText(c.params.text)).join('\n')
-  for (const word of FINAL_WORDS) expect(delivered).toContain(word)
-  for (const call of sent) {
-    expect(call.params.chat_id).toBe(CHAT)
-    expect(call.params.message_thread_id).toBe(THREAD)
+  for (const end of ['finish', 'abort'] as const) {
+    const fake = fakeApi()
+    const edit = createReplyStream({ api: fake.api, chatId: CHAT, mode: 'edit' })
+    await edit.update('preview')
+    await vi.advanceTimersByTimeAsync(1100)
+    const preview = fake.calls.find(c => c.method === 'sendMessage')
+    expect(preview?.params.reply_markup).toBeDefined()
+    if (end === 'finish') await edit.finish('final')
+    else { edit.abort(); await edit.cleanup() }
+    const cleanup = fake.calls.filter(c => (c.method.startsWith('edit') || c.method === 'deleteMessage') && c.params.message_id === 101).at(-1)
+    expect(cleanup).toBeDefined()
+    expect(JSON.stringify(cleanup?.params.reply_markup ?? {})).not.toContain('callback_data')
+    const count = fake.calls.length
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(fake.calls).toHaveLength(count)
   }
-  expect(failure).toBeUndefined()
-})
-
-test('test_h1_final_after_ladder_fell_to_text_draft_is_delivered_when_rich_does_not_work', async () => {
-  const { api, calls } = fakeApi(['sendRichMessageDraft', 'sendRichMessage'])
-  const stream = createReplyStream({ api, chatId: CHAT, threadId: THREAD })
-
-  await stream.update('первый кусок')
-  await vi.advanceTimersByTimeAsync(1100)
-  await stream.update('первый кусок и ещё')
-  await vi.advanceTimersByTimeAsync(1100)
-  expect(calls.some((c) => c.method === 'sendMessageDraft')).toBe(true)
-
-  const before = calls.length
-  const failure = await runFinish(stream, FINAL_MD)
-
-  const sent = calls.slice(before).filter((c) => c.method === 'sendMessage')
-  expect(sent.length).toBeGreaterThanOrEqual(1)
-  const delivered = sent.map((c) => plainText(c.params.text)).join('\n')
-  for (const word of FINAL_WORDS) expect(delivered).toContain(word)
-  for (const call of sent) expect(call.params.message_thread_id).toBe(THREAD)
-  expect(failure).toBeUndefined()
-})
-
-test('test_h1_edit_mode_final_removes_stop_button_from_preview_message', async () => {
-  const { api, calls } = fakeApi([])
-  const stream = createReplyStream({ api, chatId: CHAT, threadId: THREAD, mode: 'edit' })
-
-  await stream.update('черновик в режиме edit')
-  await vi.advanceTimersByTimeAsync(1100)
-  const preview = calls.find((c) => c.method === 'sendMessage')
-  expect(preview).toBeDefined()
-  expect(hasStopButton(preview?.params.reply_markup)).toBe(true)
-
-  const before = calls.length
-  const failure = await runFinish(stream, FINAL_MD)
-
-  const after = calls.slice(before)
-  const delivered = after
-    .filter((c) => c.method === 'sendRichMessage' || c.method === 'sendMessage' || c.method === 'editMessageText')
-    .map((c) => JSON.stringify(c.params) + plainText(c.params.text))
-    .join('\n')
-  for (const word of FINAL_WORDS) expect(delivered).toContain(word)
-
-  const cleanups = after.filter(
-    (c) =>
-      (c.method === 'editMessageText' || c.method === 'editMessageReplyMarkup') &&
-      c.params.message_id === PREVIEW_ID,
-  )
-  expect(cleanups.length).toBeGreaterThanOrEqual(1)
-  expect(hasStopButton(cleanups[cleanups.length - 1].params.reply_markup)).toBe(false)
-  expect(failure).toBeUndefined()
-})
-
-test('test_h1_edit_mode_with_rich_400_delivers_text_and_still_removes_stop_button', async () => {
-  const { api, calls } = fakeApi(['sendRichMessage'])
-  const stream = createReplyStream({ api, chatId: CHAT, threadId: THREAD, mode: 'edit' })
-
-  await stream.update('черновик в режиме edit')
-  await vi.advanceTimersByTimeAsync(1100)
-
-  const before = calls.length
-  const failure = await runFinish(stream, FINAL_MD)
-
-  const after = calls.slice(before)
-  const delivered = after
-    .filter((c) => c.method === 'sendMessage' || c.method === 'editMessageText')
-    .map((c) => plainText(c.params.text))
-    .join('\n')
-  for (const word of FINAL_WORDS) expect(delivered).toContain(word)
-  for (const call of after.filter((c) => c.method === 'sendMessage')) {
-    expect(call.params.message_thread_id).toBe(THREAD)
-  }
-
-  const cleanups = after.filter(
-    (c) =>
-      (c.method === 'editMessageText' || c.method === 'editMessageReplyMarkup') &&
-      c.params.message_id === PREVIEW_ID,
-  )
-  expect(cleanups.length).toBeGreaterThanOrEqual(1)
-  expect(hasStopButton(cleanups[cleanups.length - 1].params.reply_markup)).toBe(false)
-  expect(failure).toBeUndefined()
 })

@@ -77,6 +77,18 @@ function readEvents(file: string): SessionEvent[] {
   return events
 }
 
+/** Events of the newest archive of a session (`<id>.bak-*`), read once and without a handle. */
+export function readNewestArchiveEvents(root: string, id: string): SessionEvent[] {
+  if (!existsSync(root)) return []
+  const prefix = `${id}.bak-`
+  const newest = readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix) && SAFE_ID.test(entry.name))
+    .map((entry) => entry.name)
+    .sort()
+    .at(-1)
+  return newest === undefined ? [] : readEvents(join(root, newest, EVENTS_FILE))
+}
+
 class JsonlSessionHandle implements SessionHandle {
   readonly id: SessionId
   readonly header: SessionHeader

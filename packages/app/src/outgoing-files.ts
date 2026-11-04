@@ -267,21 +267,20 @@ export function createSendFileTool(deps: SendFileToolDeps): RunnerTool {
   return {
     name: 'send_file',
     description:
-      'Отправить владельцу файл из workspace вложением в чат: документ, фото, аудио или голосовое. ' +
-      'Используй, когда владелец просит «пришли файлом», «пришли PNG/PDF/CSV». Путь — внутри workspace ' +
-      '(например, outbox или downloads). Имя файла сохраняется, файл уходит байт в байт. Ответ содержит message_id и размер.',
+      'Send the owner a workspace file as a chat attachment: document, photo, audio or voice (голосовое). ' +
+      'Use when asked to send a file. Name and bytes are kept. Returns message_id and size.',
     inputSchema: {
       type: 'object',
       properties: {
         path: {
           type: 'string',
-          description: 'Путь к файлу внутри workspace: абсолютный или относительно DSHBOT_HOME/workspace',
+          description: 'File inside the workspace.',
         },
-        caption: { type: 'string', description: 'Подпись к файлу в чате владельца' },
+        caption: { type: 'string', description: 'Caption.' },
         as: {
           type: 'string',
           enum: ['document', 'photo', 'audio', 'voice'],
-          description: 'Вид отправки; по умолчанию картинки — фото, остальное — документ',
+          description: 'Default: photo for images, else document.',
         },
       },
       required: ['path'],

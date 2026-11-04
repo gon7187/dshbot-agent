@@ -2,10 +2,12 @@
 // appended to its own ledger with the label `wake`. There is no cap here on
 // purpose: the owner's decision is "count, do not limit".
 //
-// The harness keeps the token accounting of each step in the `assistant/message`
-// event of the durable session (`usage`), so a wake-up turn is read from the
-// session log of `main`. Only events appended after the turn began are taken:
-// the host snapshots the event count before the prompt.
+// A scheduled wake-up runs in a transient session that the runner removes after
+// the turn, so its spend is taken from the runner's per-turn report and recorded
+// under the id of that session. The `assistant/message` events of a durable
+// session log (`usage`) serve the wake-up turns that stay in `main`, such as
+// an external event: only events appended after the turn began are taken, the
+// host snapshots the event count before the prompt.
 
 import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'

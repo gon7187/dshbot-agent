@@ -73,6 +73,8 @@ usage() {
   DSHBOT_INSTALL_SRC  каталог с исходниками (по умолчанию корень этого репозитория)
   DSHBOT_INSTALL_ORIGIN  адрес remote origin приложения для самообновления
                       (по умолчанию origin источника)
+  DSHBOT_SANDBOX_TOOLKIT  0 — не ставить набор инструментов песочницы
+                      (Python-окружение, npm-пакеты, подсказка apt)
 
 Подробности: docs/INSTALL.md
 EOF
@@ -665,6 +667,116 @@ EOF
     { rm -f -- "$tmp"; die "не удалось установить $shim"; }
 }
 
+# --- набор инструментов песочницы ---------------------------------------------------------------
+
+# Непустые строки списка пакетов без комментариев; по одной на строку.
+read_package_list() {
+  [ -r "$1" ] || return 1
+  sed -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -- "$1" | sed -e '/^$/d'
+}
+
+# Ставит пакеты в venv только готовыми колёсами: сборка из исходников на ARM
+# долгая. Сначала одной командой, при сбое по одному, чтобы один ненайденный
+# пакет не лишал остальных. Печатает пакеты, которые не встали.
+pyenv_install() {
+  local venv=$1 name
+  shift
+  if pyenv_install_batch "$venv" "$@" >&2; then
+    return 0
+  fi
+  for name in "$@"; do
+    pyenv_install_batch "$venv" "$name" >&2 || printf '%s\n' "$name"
+  done
+}
+
+pyenv_install_batch() {
+  local venv=$1
+  shift
+  "$venv/bin/python3" -m pip install --only-binary :all: "$@"
+}
+
+install_sandbox_python() {
+  local venv=$data_dir/tools/pyenv list=$app_dir/scripts/sandbox-python.txt
+  local -a packages=()
+  local line failed created=false
+  local retry="python3 -m venv $venv && $venv/bin/python3 -m pip install --only-binary :all: -r $list"
+  while IFS= read -r line; do packages+=("$line"); done < <(read_package_list "$list")
+  if [ "${#packages[@]}" -eq 0 ]; then
+    warn "список пакетов Python пуст или не читается ($list); окружение $venv не настроено."
+    return 0
+  fi
+  if [ ! -x "$venv/bin/python3" ]; then
+    if ! have python3; then
+      warn "не найден python3: окружение Python для песочницы не создано. Поставьте python3 с модулем venv и повторите: $retry"
+      return 0
+    fi
+    # Убирается только то, что сделала эта попытка: чужое на месте venv не трогаем.
+    local existed=false
+    if [ -e "$venv" ] || [ -L "$venv" ]; then existed=true; fi
+    mkdir -p -- "$data_dir/tools" && python3 -m venv "$venv" || {
+      [ "$existed" = true ] || rm -rf -- "$venv"
+      warn "не удалось создать venv $venv (нужен python3 с модулем venv, например пакет python3-venv). Повторите вручную: $retry"
+      return 0
+    }
+    created=true
+  fi
+  failed=$(pyenv_install "$venv" "${packages[@]}")
+  if [ -n "$failed" ]; then
+    warn "не установлены пакеты Python: $(printf '%s' "$failed" | tr '\n' ' '). Повторите вручную: $retry"
+    return 0
+  fi
+  if [ "$created" = true ]; then
+    say "Создано окружение Python для песочницы: $venv"
+  else
+    say "Окружение Python для песочницы дополнено: $venv"
+  fi
+}
+
+install_sandbox_npm() {
+  local prefix=$data_dir/tools/npm list=$app_dir/scripts/sandbox-npm.txt
+  local -a packages=()
+  local line
+  while IFS= read -r line; do packages+=("$line"); done < <(read_package_list "$list")
+  [ "${#packages[@]}" -gt 0 ] || return 0
+  local retry="NPM_CONFIG_PREFIX=$prefix npm install -g ${packages[*]}"
+  if ! have npm; then
+    warn "не найден npm: npm-пакеты песочницы не установлены. Повторите: $retry"
+    return 0
+  fi
+  mkdir -p -- "$prefix" && NPM_CONFIG_PREFIX=$prefix npm install -g "${packages[@]}" >&2 || {
+    warn "не удалось установить npm-пакеты песочницы в $prefix. Повторите вручную: $retry"
+    return 0
+  }
+  say "Установлены npm-пакеты песочницы в $prefix: ${packages[*]}"
+}
+
+# sudo установщик не вызывает: печатает одну команду для недостающих программ.
+print_sandbox_apt_hint() {
+  local missing=""
+  have rg || missing="$missing ripgrep"
+  have fd || have fdfind || missing="$missing fd-find"
+  have shellcheck || missing="$missing shellcheck"
+  have shfmt || missing="$missing shfmt"
+  have pandoc || missing="$missing pandoc"
+  have pdftotext || missing="$missing poppler-utils"
+  have tesseract || missing="$missing tesseract-ocr tesseract-ocr-rus"
+  have convert || missing="$missing imagemagick"
+  [ -n "$missing" ] || return 0
+  say "Для набора инструментов песочницы не хватает системных программ. Поставьте их (нужен sudo):"
+  say "  sudo apt-get install$missing"
+}
+
+# Любой сбой набора только предупреждает: бот ставится как обычно.
+install_sandbox_toolkit() {
+  if [ "${DSHBOT_SANDBOX_TOOLKIT:-}" = 0 ]; then
+    say "Набор инструментов песочницы пропущен (DSHBOT_SANDBOX_TOOLKIT=0)."
+    return 0
+  fi
+  install_sandbox_python
+  install_sandbox_npm
+  print_sandbox_apt_hint
+}
+
 # --- службы -------------------------------------------------------------------------------------
 
 # Файл юнита или симлинк прежней ручной установки, в том числе висячий.
@@ -1048,6 +1160,7 @@ do_install() {
   write_env_file
   install_launch_shim
   install_units
+  install_sandbox_toolkit
   offer_migration
   # Отметка времени до start/restart: код привязки прошлого процесса уже лежит
   # в журнале и не должен быть принят за код нового запуска.

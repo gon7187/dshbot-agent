@@ -1,0 +1,8 @@
+- insert:
+    - id: dshbot-superagent-guard
+      name: dshbot-superagent-telegram/guard
+    # Last-id-wins composition replaces the upstream Runtime implementation while preserving its id/config.
+    - id: dsh-superagent
+      name: dshbot-superagent-telegram/runtime
+    - id: dshbot-superagent-telegram
+      name: dshbot-superagent-telegram

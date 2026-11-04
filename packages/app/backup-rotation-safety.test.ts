@@ -102,3 +102,13 @@ test('test_h1_last_snapshot_ignores_directories_that_are_not_snapshots', () => {
   rmSync(join(backups, names[0] ?? ''), { recursive: true, force: true })
   expect(lastSnapshot(home)).toBeUndefined()
 })
+
+test('c8 snapshot excludes installed tools while retaining backed up state', () => {
+  mkdirSync(join(home, 'tools', 'bin'), { recursive: true })
+  writeFileSync(join(home, 'tools', 'bin', 'example'), 'installed program')
+  const [name] = takeSnapshots(1, 3)
+  const snapshot = join(home, 'backups', name ?? '')
+  expect(existsSync(join(snapshot, 'state.db'))).toBe(true)
+  expect(existsSync(join(snapshot, 'tools'))).toBe(false)
+  expect(existsSync(join(home, 'tools', 'bin', 'example'))).toBe(true)
+})

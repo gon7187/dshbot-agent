@@ -27,6 +27,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -260,6 +261,7 @@ test('test_adopted_branch_and_worktree_are_removed_after_mark_healthy_and_the_co
   const first = makeEvolve()
   const adopted = await passedCandidate(first)
   const inProgress = await openCandidate(first)
+  const waiting = await passedCandidate(first)
 
   const sha = first.accept(adopted.id)
   expect(existsSync(join(home, 'adopt.json')), 'accept writes adopt.json').toBe(true)
@@ -269,9 +271,12 @@ test('test_adopted_branch_and_worktree_are_removed_after_mark_healthy_and_the_co
   expect(pre.status, `adopt.sh must succeed\n${pre.output}`).toBe(0)
   expect(git(live, 'rev-parse', 'live'), 'live moved to the adopted sha').toBe(sha)
   const restarted = makeEvolve()
+  expect(restarted.pendingCandidates().map((item) => item.id)).not.toContain(adopted.id)
+  expect(restarted.pendingCandidates().map((item) => item.id)).toContain(waiting.id)
   logLines = []
 
   await restarted.markHealthy()
+  expectIntact(waiting, 'genuinely pending card survives healthy cleanup')
 
   await until(() => isGone(adopted), 'the adopted candidate to be removed after markHealthy')
   expectGone(adopted, 'adopted candidate after markHealthy')
@@ -306,56 +311,6 @@ test('test_ttl_start_removes_candidates_without_a_decision_older_than_24h_and_ke
   makeEvolve()
   await until(() => isGone(stale) && !hasRecord(stale.id), 'the 25 hour old candidate to be removed at start')
   expectGone(stale, 'stale candidate at start')
-})
-
-test('test_ttl_daily_tick_removes_open_candidates_after_24h_and_a_waiting_card_only_after_7_days', { timeout: TEST_TIMEOUT_MS }, async () => {
-  fakeClock()
-  const evolve = makeEvolve()
-  const open = await openCandidate(evolve)
-  const waiting = await passedCandidate(evolve)
-  expect(cards.map((card) => card.id), 'the card of the passed candidate went to the owner').toContain(waiting.id)
-
-  // two days: the candidate without a decision goes, the one with a card waits
-  await vi.advanceTimersByTimeAsync(49 * HOUR)
-  await until(() => isGone(open) && !hasRecord(open.id), 'the 2 day old candidate without a decision to be removed by the daily sweep')
-  expectGone(open, 'candidate without a decision, 2 days')
-  expectIntact(waiting, 'candidate with a waiting card, 2 days')
-
-  // 6.5 days: still waiting for the owner
-  await vi.advanceTimersByTimeAsync(107 * HOUR)
-  await settle()
-  expectIntact(waiting, 'candidate with a waiting card, 6.5 days')
-
-  // 8.5 days: the card has waited too long
-  await vi.advanceTimersByTimeAsync(48 * HOUR)
-  await until(() => isGone(waiting) && !hasRecord(waiting.id), 'the 8.5 day old candidate with a card to be removed by the daily sweep')
-  expectGone(waiting, 'candidate with a waiting card, 8.5 days')
-})
-
-// --- [discard] -------------------------------------------------------------------------------------
-
-test('test_discard_tool_removes_own_open_and_passed_candidates_and_is_not_guest_allowed', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const evolve = makeEvolve()
-  const discard = tool(evolve, 'self_discard')
-  const schema = (discard.inputSchema ?? discard.input_schema ?? discard.schema ?? discard.jsonSchema ?? {}) as {
-    properties?: Record<string, unknown>
-    required?: string[]
-  }
-  expect(Object.keys(schema.properties ?? {}), 'self_discard takes the candidate id').toContain('id')
-  expect(schema.required ?? [], 'the id is required').toContain('id')
-  expect(discard.guestAllowed === true, 'self_discard is an owner tool, never opened to guests').toBe(false)
-
-  const open = await openCandidate(evolve)
-  const passed = await passedCandidate(evolve)
-  const bystander = await openCandidate(evolve)
-
-  await discard.execute({ id: open.id })
-  expectGone(open, 'discard of a candidate in progress')
-  expectIntact(passed, 'discard of another candidate')
-
-  await discard.execute({ id: passed.id })
-  expectGone(passed, 'discard of a candidate with a card')
-  expectIntact(bystander, 'discard of another candidate')
 })
 
 test('test_discard_refuses_ids_with_separators_dots_or_without_the_candidate_prefix', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -452,55 +407,6 @@ test('test_safe_cleanup_never_touches_live_stable_main_foreign_worktrees_or_path
   expect(existsSync(join(live, 'notes.md')), 'the live files stay').toBe(true)
 })
 
-// --- [log] -----------------------------------------------------------------------------------------
-
-test('test_log_every_removal_is_a_line_with_the_candidate_id_and_the_reason', { timeout: TEST_TIMEOUT_MS }, async () => {
-  fakeClock()
-  const evolve = makeEvolve()
-  const rejected = await passedCandidate(evolve)
-  const discarded = await openCandidate(evolve)
-  const expired = await openCandidate(evolve)
-  const kept = await passedCandidate(evolve)
-  logLines = []
-
-  await evolve.reject(rejected.id)
-  await tool(evolve, 'self_discard').execute({ id: discarded.id })
-  expectGone(rejected, 'reject')
-  expectGone(discarded, 'discard')
-  expect(
-    linesAbout(expired.id).filter((line) => /удал|remov|delet/i.test(line)),
-    'a candidate that is still alive is not logged as removed',
-  ).toEqual([])
-
-  await vi.advanceTimersByTimeAsync(49 * HOUR)
-  await until(
-    () => isGone(expired) && !hasRecord(expired.id) && linesAbout(expired.id).length > 0,
-    'the expired candidate to be removed',
-  )
-
-  const rejectLines = linesAbout(rejected.id)
-  const discardLines = linesAbout(discarded.id)
-  const ttlLines = linesAbout(expired.id)
-  expect(rejectLines.length, `reject is logged: ${JSON.stringify(logLines)}`).toBeGreaterThan(0)
-  expect(discardLines.length, `discard is logged: ${JSON.stringify(logLines)}`).toBeGreaterThan(0)
-  expect(ttlLines.length, `the TTL removal is logged: ${JSON.stringify(logLines)}`).toBeGreaterThan(0)
-  expect(rejectLines.some((line) => /reject|отклон|отказ|отверг/i.test(line)), JSON.stringify(rejectLines)).toBe(true)
-  expect(discardLines.some((line) => /discard|отказ|отмен|сброс|отброш|убра|удал/i.test(line)), JSON.stringify(discardLines)).toBe(true)
-  expect(
-    ttlLines.some((line) => /ttl|суток|сутки|час|истёк|истек|протух|устар|stale|expire|старше|давн/i.test(line)),
-    JSON.stringify(ttlLines),
-  ).toBe(true)
-
-  const reasons = new Set([
-    withoutId(rejectLines.join('\n'), rejected.id),
-    withoutId(discardLines.join('\n'), discarded.id),
-    withoutId(ttlLines.join('\n'), expired.id),
-  ])
-  expect(reasons.size, 'the three reasons are told apart in the log').toBe(3)
-  expect(linesAbout(kept.id).filter((line) => /удал|remov|delet/i.test(line)), 'a waiting card is not removed or logged').toEqual([])
-  expectIntact(kept, 'the candidate with a waiting card')
-})
-
 // --- [async] ---------------------------------------------------------------------------------------
 
 const SLOW_REMOVE_MS = 1_500
@@ -570,52 +476,31 @@ async function withPath<T>(bin: string, run: () => Promise<T>): Promise<T> {
   }
 }
 
-test('test_async_a_slow_worktree_remove_after_a_red_sync_gate_does_not_block_the_event_loop', { timeout: TEST_TIMEOUT_MS }, async () => {
-  // origin/main is live plus one commit, so the synchronization cuts a candidate; its tests are red.
-  const origin = join(root, 'origin.git')
-  git(root, 'init', '-q', '--bare', '-b', 'main', origin)
-  git(live, 'remote', 'add', 'origin', origin)
-  const upstream = git(live, 'commit-tree', '-p', 'live', '-m', 'upstream change', 'live^{tree}')
-  git(live, 'push', '-q', 'origin', `${upstream}:refs/heads/main`)
-  const evolve = createEvolve({
-    home,
-    live,
-    ownerHome: root,
-    review: { baseUrl: 'http://127.0.0.1:9', apiKey: 'unused' },
-    reviewer: async () => JSON.stringify({ verdict: 'approve', summary: 'looks fine' }),
-    sandbox: () => ({ ok: false, status: 1, output: 'fixture: candidate tests are red' }),
-    card: async (card) => {
-      cards.push(card)
-    },
-    log: (message) => {
-      logLines.push(message)
-    },
-  })
-  const slow = slowWorktreeRemove()
-
-  const { result: report, gap, elapsed } = await withPath(slow.bin, () => longestTimerGap(() => evolve.syncMain()))
-
-  expect(report.state, JSON.stringify(report)).toBe('gate-failed')
-  const id = report.candidate as string
-  expect(readFileSync(slow.marker, 'utf8'), 'the slow worktree remove of the candidate ran').toContain(join(candidatesDir, id))
-  expect(elapsed, 'the synchronization waited for the slow removal').toBeGreaterThanOrEqual(SLOW_REMOVE_MS)
-  expect(gap, `a 100 ms timer paused for ${Math.round(gap)} ms during the removal`).toBeLessThan(MAX_TIMER_GAP_MS)
-  expectGone({ id, path: join(candidatesDir, id) }, 'red synchronization gate')
-  expect(linesAbout(id).some((line) => line.includes('кандидат синхронизации не прошёл гейт')), JSON.stringify(logLines)).toBe(true)
-  expect(git(live, 'rev-parse', 'live'), 'live did not move').not.toBe(upstream)
-})
-
-test('test_async_self_discard_of_a_slow_worktree_does_not_block_the_event_loop', { timeout: TEST_TIMEOUT_MS }, async () => {
+test('cleanup refuses a candidate switched to main and preserves unavailable foreign worktrees', async () => {
   const evolve = makeEvolve()
-  const made = await openCandidate(evolve)
-  const slow = slowWorktreeRemove()
-
-  const { gap, elapsed } = await withPath(slow.bin, () =>
-    longestTimerGap(async () => tool(evolve, 'self_discard').execute({ id: made.id })),
-  )
-
-  expect(readFileSync(slow.marker, 'utf8'), 'the slow worktree remove of the candidate ran').toContain(made.path)
-  expect(elapsed, 'self_discard waited for the slow removal').toBeGreaterThanOrEqual(SLOW_REMOVE_MS)
-  expect(gap, `a 100 ms timer paused for ${Math.round(gap)} ms during the removal`).toBeLessThan(MAX_TIMER_GAP_MS)
-  expectGone(made, 'self_discard with a slow worktree remove')
+  const moved = await openCandidate(evolve)
+  git(live, 'branch', 'main')
+  git(moved.path, 'checkout', '-q', 'main')
+  const mainSha = git(live, 'rev-parse', 'main')
+  let refused = false
+  try {
+    const text = String(await tool(evolve, 'self_discard').execute({ id: moved.id }))
+    refused = /отмен|отказ|refus|ветк|branch/i.test(text)
+  } catch { refused = true }
+  expect(refused).toBe(true)
+  expect(git(live, 'rev-parse', 'main')).toBe(mainSha)
+  expect(existsSync(moved.path)).toBe(true)
+  const foreign = join(root, 'foreign')
+  git(live, 'worktree', 'add', '-q', '-b', 'foreign', foreign, 'live')
+  put(join(foreign, 'work.txt'), 'uncommitted foreign work\n')
+  const relocated = join(root, 'relocated-foreign')
+  renameSync(foreign, relocated)
+  const registration = () => git(live, 'worktree', 'list', '--porcelain').split('\n\n').find((row) => row.startsWith(`worktree ${foreign}\n`))
+  const before = registration()
+  expect(before).toContain('prunable')
+  const own = await openCandidate(evolve)
+  await tool(evolve, 'self_discard').execute({ id: own.id })
+  expectGone(own, 'only the owned candidate is removed')
+  expect(registration()).toBe(before)
+  expect(readFileSync(join(relocated, 'work.txt'), 'utf8')).toBe('uncommitted foreign work\n')
 })

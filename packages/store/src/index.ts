@@ -98,6 +98,11 @@ export interface UsageRecord {
   cacheWriteTokens?: number
   outputTokens: number
   /**
+   * Schedule job whose planned run made the call. Absent for every other call
+   * (owner turns, reviews, guests) and for rows written before the column.
+   */
+  jobId?: string
+  /**
    * Cost in US dollars, or `null` when the model has no price. An unknown
    * price is stored as SQL NULL and never folded into a zero.
    */
@@ -116,6 +121,11 @@ export interface UsageSummary {
   cacheReadTokens: number
   cacheWriteTokens: number
   outputTokens: number
+}
+
+/** Aggregates of one schedule job's planned runs in a window. */
+export interface UsageJobSummary extends UsageSummary {
+  jobId: string
 }
 
 export interface UsageReport {
@@ -144,6 +154,16 @@ export interface Usage {
    * `main` is read with this boundary; the rows themselves stay untouched.
    */
   summarySince(since: number): UsageSummary
+  /**
+   * Per-job aggregates of the calls at or after `since` that carry a job id,
+   * most expensive first. Calls without a job id appear in no row.
+   */
+  jobsSince(since: number): UsageJobSummary[]
+  /**
+   * Model calls of one session at or after `since` and their mean prompt size,
+   * `input + cacheRead` per call; `averagePromptTokens` is `null` without calls.
+   */
+  promptSince(sessionId: string, since: number): { calls: number; averagePromptTokens: number | null }
   /** Rows in insertion order; for diagnostics and tests. */
   rows(): UsageRecord[]
 }
@@ -151,10 +171,11 @@ export interface Usage {
 /** One permanent permission the owner gave with the "Всегда" button of a card. */
 export interface ApprovalPermission {
   id: number
-  /** `exec` for the sandboxed tool, `host` for `host_exec` and ssh. */
+  /** `exec` for the sandboxed tool, `host` for `host_exec` and ssh, `mcp` for a plan type of a destructive MCP tool. */
   kind: string
-  /** Alias of the host for `host`; an empty string for `exec`. */
+  /** Alias of the host for `host`; the tool the argument comes from for `mcp`; an empty string for `exec`. */
   host: string
+  /** The command text; for `mcp` the destructive tool that applies the plan. */
   command: string
   /** Unix epoch milliseconds of the moment the owner pressed "Всегда". */
   createdAt: number
@@ -234,6 +255,9 @@ const USAGE_STEPS: readonly string[] = [
     cost_usd REAL
   )`,
   `CREATE INDEX IF NOT EXISTS usage_ts_idx ON usage (ts)`,
+  // The schedule job of a planned run's call; NULL for every older row and for
+  // calls that no job made, so the windows keep counting them as before.
+  `ALTER TABLE usage ADD COLUMN job_id TEXT`,
 ]
 
 const DAY_MS = 86_400_000
@@ -286,6 +310,7 @@ interface UsageRow {
   cache_write_tokens: number
   output_tokens: number
   cost_usd: number | null
+  job_id: string | null
 }
 
 interface UsageAggregateRow {
@@ -419,11 +444,11 @@ function initialize(db: DatabaseSync): Store {
 
   const insertUsage = db.prepare(
     `INSERT INTO usage
-       (ts, session_id, model, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_usd)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (ts, session_id, model, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_usd, job_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
   const allUsage = db.prepare(
-    `SELECT ts, session_id, model, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_usd
+    `SELECT ts, session_id, model, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_usd, job_id
      FROM usage ORDER BY id`,
   )
   const usageWindow = db.prepare(
@@ -437,20 +462,36 @@ function initialize(db: DatabaseSync): Store {
        COALESCE(SUM(output_tokens), 0) AS output
      FROM usage WHERE ts >= ?`,
   )
+  const jobWindow = db.prepare(
+    `SELECT
+       job_id,
+       COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL THEN cost_usd END), 0) AS cost,
+       COUNT(*) AS calls,
+       COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS unpriced,
+       COALESCE(SUM(input_tokens), 0) AS input,
+       COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
+       COALESCE(SUM(cache_write_tokens), 0) AS cache_write,
+       COALESCE(SUM(output_tokens), 0) AS output
+     FROM usage WHERE ts >= ? AND job_id IS NOT NULL
+     GROUP BY job_id ORDER BY cost DESC, calls DESC, job_id`,
+  )
 
-  function summarize(since: number): UsageSummary {
-    const row = usageWindow.get(since) as UsageAggregateRow | undefined
-    if (row === undefined) {
-      return {
-        costUsd: 0,
-        calls: 0,
-        unpricedCalls: 0,
-        inputTokens: 0,
-        cacheReadTokens: 0,
-        cacheWriteTokens: 0,
-        outputTokens: 0,
-      }
-    }
+  const promptWindow = db.prepare(
+    `SELECT COUNT(*) AS calls, AVG(input_tokens + cache_read_tokens) AS prompt
+     FROM usage WHERE session_id = ? AND ts >= ?`,
+  )
+
+  const emptySummary = (): UsageSummary => ({
+    costUsd: 0,
+    calls: 0,
+    unpricedCalls: 0,
+    inputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 0,
+  })
+
+  function toSummary(row: UsageAggregateRow): UsageSummary {
     return {
       costUsd: row.cost === null ? 0 : toNumber(row.cost),
       calls: toNumber(row.calls),
@@ -460,6 +501,11 @@ function initialize(db: DatabaseSync): Store {
       cacheWriteTokens: row.cache_write === null ? 0 : toNumber(row.cache_write),
       outputTokens: row.output === null ? 0 : toNumber(row.output),
     }
+  }
+
+  function summarize(since: number): UsageSummary {
+    const row = usageWindow.get(since) as UsageAggregateRow | undefined
+    return row === undefined ? emptySummary() : toSummary(row)
   }
 
   const usage: Usage = {
@@ -482,7 +528,13 @@ function initialize(db: DatabaseSync): Store {
       if (costUsd !== null && (typeof costUsd !== 'number' || !Number.isFinite(costUsd) || costUsd < 0)) {
         throw new TypeError('usage.record: costUsd must be null or a finite non-negative number')
       }
-      insertUsage.run(at, record.sessionId, record.model, inputTokens, cacheReadTokens, cacheWriteTokens, outputTokens, costUsd)
+      if (record.jobId !== undefined && (typeof record.jobId !== 'string' || record.jobId.length === 0)) {
+        throw new TypeError('usage.record: jobId must be a non-empty string')
+      }
+      insertUsage.run(
+        at, record.sessionId, record.model, inputTokens, cacheReadTokens, cacheWriteTokens, outputTokens, costUsd,
+        record.jobId ?? null,
+      )
     },
     report(now = Date.now()) {
       const at = Number.isFinite(now) ? Math.trunc(now) : Date.now()
@@ -503,6 +555,17 @@ function initialize(db: DatabaseSync): Store {
       const at = Number.isFinite(since) ? Math.trunc(since) : 0
       return summarize(at)
     },
+    jobsSince(since) {
+      const at = Number.isFinite(since) ? Math.trunc(since) : 0
+      const rows = jobWindow.all(at) as unknown as (UsageAggregateRow & { job_id: string })[]
+      return rows.map((row) => ({ jobId: row.job_id, ...toSummary(row) }))
+    },
+    promptSince(sessionId, since) {
+      const at = Number.isFinite(since) ? Math.trunc(since) : 0
+      const row = promptWindow.get(sessionId, at) as { calls: number | bigint; prompt: number | bigint | null } | undefined
+      if (row === undefined || row.prompt === null) return { calls: 0, averagePromptTokens: null }
+      return { calls: toNumber(row.calls), averagePromptTokens: toNumber(row.prompt) }
+    },
     rows() {
       const rows = allUsage.all() as unknown as UsageRow[]
       return rows.map((row) => ({
@@ -514,6 +577,7 @@ function initialize(db: DatabaseSync): Store {
         cacheWriteTokens: toNumber(row.cache_write_tokens),
         outputTokens: toNumber(row.output_tokens),
         costUsd: row.cost_usd === null ? null : toNumber(row.cost_usd),
+        ...(row.job_id === null ? {} : { jobId: row.job_id }),
       }))
     },
   }

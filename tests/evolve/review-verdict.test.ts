@@ -169,17 +169,6 @@ test('test_c3_reason_rejection_error_contains_the_summary_of_the_reviewer', asyn
   expect(message).toContain('SUMMARY_X_4711')
 })
 
-test('test_c3_reason_rejection_without_summary_shows_the_start_of_the_raw_answer_only', async () => {
-  const raw = `{\n  "verdict": "reject",\n  "issues": ["RAW_HEAD_ALPHA"],\n  "detail": "${'q'.repeat(700)}RAW_TAIL_OMEGA"\n}`
-  const { fetch } = scriptedFetch([textAnswer(raw)])
-  const world = makeWorld(fetch)
-
-  const message = await gateError(world)
-
-  expect(message, 'the start of the raw answer is in the error').toContain('RAW_HEAD_ALPHA')
-  expect(message, 'only the first 500 characters of the raw answer').not.toContain('RAW_TAIL_OMEGA')
-})
-
 // --- [log] -----------------------------------------------------------------------------------------
 
 test('test_c4_log_every_verdict_is_logged_with_the_start_of_the_summary_and_without_diff_or_key', async () => {

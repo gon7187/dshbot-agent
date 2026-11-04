@@ -159,3 +159,37 @@ test.skipIf(!sandboxed)('test_exec_filesystem_root_keeps_the_private_proc_and_hi
   const write = await run(`echo WS > ${join(workspace, 'w.txt')}`)
   expect(write.exit, write.text).toBe(0)
 })
+
+test('explicit empty toolchain paths never mount default owner programs', async ({ skip }) => {
+  const scratch = mkdtempSync(join(tmpdir(), 'dshbot-ro-override-'))
+  const home = join(scratch, 'owner')
+  const workspace = join(scratch, 'candidate')
+  mkdirSync(join(home, '.local/bin'), { recursive: true })
+  mkdirSync(workspace)
+  const sentinel = join(home, '.local/bin/private-owner-program')
+  writeFileSync(sentinel, 'PRIVATE-OWNER-PROGRAM')
+  const profile = sandboxProfile({ home, workspace, roPaths: [] })
+  let runtime: Awaited<ReturnType<typeof createExecTools>> | undefined
+  try {
+    if (spawnSync(profile[0]!, [...profile.slice(1), '/bin/true'], { timeout: 10_000 }).status !== 0) skip()
+    runtime = await createExecTools({ home, workspace, roPaths: [] })
+    const tool = runtime.tools.find((candidate) => candidate.name === 'exec')!
+    const output = String(await tool.execute({ command: `cat '${sentinel}'` }, { signal: new AbortController().signal }))
+    expect(output.startsWith('exit 0\n'), output).toBe(false)
+    expect(output).not.toContain('PRIVATE-OWNER-PROGRAM')
+  } finally {
+    await runtime?.stop()
+    rmSync(scratch, { recursive: true, force: true })
+  }
+})
+
+test.skipIf(!sandboxed)('the trusted daemon Node and npm work with a writable workspace', { timeout: 30_000 }, async () => {
+  scratch = realpathSync(mkdtempSync(join(tmpdir(), 'exec-node-core-')))
+  const workspace = join(scratch, 'workspace')
+  mkdirSync(workspace)
+  exec = await createExecTools({ workspace, home: HOME })
+  const answer = await run('node --version && npm --version && echo WORKSPACE > local-marker')
+  expect(answer.exit, answer.text).toBe(0)
+  expect(answer.text).toContain(process.version)
+  expect(readFileSync(join(workspace, 'local-marker'), 'utf8')).toBe('WORKSPACE\n')
+})

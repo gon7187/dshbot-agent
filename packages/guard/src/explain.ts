@@ -1,9 +1,9 @@
 // Plain-Russian explanations of a confirm-class command for the owner card.
 //
-// The explanation is built from the command itself and from the rule the guard
-// matched, never from free text: the owner reads what will happen on «Разрешить»,
-// not the English code of the rule. Every sentence names the action and its
-// object (paths, remote, unit, process, table); text is bounded so a card with
+// Consequences are built from the command itself and from the rule the guard
+// matched; a supplied purpose is labelled separately as the model's words.
+// Every consequence names the action and its object (paths, remote, unit,
+// process, table); text is bounded so a card with
 // hundreds of paths still fits one Telegram message.
 
 // The guard's own rules decide which step of a compound line is worth a
@@ -15,6 +15,8 @@ import { checkCommand, commandWordIndex } from './index.js'
 export interface ExplainCommandOptions {
   /** Alias of the owner's host when the command runs through `host_exec`. */
   host?: string
+  /** Declared intent; replace generic narration, retain independently known consequences. */
+  purpose?: string
 }
 
 const MAX_ITEMS = 3
@@ -249,6 +251,7 @@ interface RepeatedAction {
 interface Description {
   writes: Writes
   entries: SentenceEntry[]
+  consequencesOnly: boolean
   pendingRepeat?: RepeatedAction & { steps: number }
 }
 
@@ -961,8 +964,9 @@ function serviceRepeat(args: string[], context: string[]): RepeatedAction | unde
 }
 
 /** The sentence of the step's own command, or `undefined` when the guard lets it run. */
-function ownSentence(step: Step, visible: Map<string, Value>, writes: Writes): StepSentence | undefined {
+function ownSentence(step: Step, visible: Map<string, Value>, writes: Writes, consequencesOnly: boolean): StepSentence | undefined {
   if (step.opaque !== undefined) {
+    if (consequencesOnly) return undefined
     const check = checkCommand(step.opaque)
     if (check.verdict === 'allow') return undefined
     // Opaque code may contain a destructive step; never discard it for space.
@@ -1021,6 +1025,7 @@ function ownSentence(step: Step, visible: Map<string, Value>, writes: Writes): S
     if (command === 'systemctl') repeat = serviceRepeat(args, display.slice(0, index))
     irreversible = ['reboot', 'poweroff', 'halt', 'kexec', 'emergency', 'rescue'].some((verb) => args.includes(verb))
   }
+  if (sentence === undefined && consequencesOnly) return undefined
   sentence ??= stepSentence(text, check.reason)
 
   const sources: string[] = []
@@ -1080,7 +1085,7 @@ function describeLine(line: Line, outer: Map<string, Value>, description: Descri
   const visible = new Map(outer)
   for (const step of line.steps) {
     for (const inner of step.nested) describeLine(inner, visible, description)
-    const sentence = ownSentence(step, visible, description.writes)
+    const sentence = ownSentence(step, visible, description.writes, description.consequencesOnly)
     if (sentence !== undefined) addSentence(description, sentence)
     else flushRepeat(description)
     const { assignments, persist } = assignmentsOf(step)
@@ -1106,10 +1111,10 @@ function stepsWord(count: number): string {
  * line cannot be split or no step asks, so the reason-specific fallback still
  * decides the text.
  */
-function describeCompound(command: string, host: string | undefined): string {
+function describeCompound(command: string, host: string | undefined, consequencesOnly: boolean): string {
   const line = parseLine(command, 0)
   if (line === null) return ''
-  const description: Description = { writes: scanWrites(line, noWrites()), entries: [] }
+  const description: Description = { writes: scanWrites(line, noWrites()), entries: [], consequencesOnly }
   describeLine(line, new Map(), description)
   flushRepeat(description)
   const entries = description.entries
@@ -1243,8 +1248,16 @@ function describeService(tokens: string[], host: string | undefined): string {
  * English code itself.
  */
 export function explainCommand(command: string, reason: string, options: ExplainCommandOptions = {}): string {
+  const purpose = options.purpose?.trim()
+  const explanation = commandExplanation(command, reason, options, purpose !== undefined && purpose !== '')
+  return purpose
+    ? `Зачем (со слов бота): ${purpose}${explanation === '' ? '' : `\n\n${explanation}`}`
+    : explanation
+}
+
+function commandExplanation(command: string, reason: string, options: ExplainCommandOptions, consequencesOnly: boolean): string {
   const host = options.host
-  const compound = describeCompound(command, host)
+  const compound = describeCompound(command, host, consequencesOnly)
   if (compound !== '') return compound
   const tokens = shellTokens(command)
   const code = reason.split(';')[0]?.trim() ?? ''
@@ -1272,6 +1285,7 @@ export function explainCommand(command: string, reason: string, options: Explain
   if (/^irreversible: \S+ stops or restarts a service/.test(code)) {
     return describeService(tokens, host)
   }
+  if (consequencesOnly) return onHost('', host).trim()
   if (code.startsWith('unparseable:')) {
     return onHost(
       `Я не могу заранее понять, что именно выполнит эта команда: ${unparseableDetail(code)}. ` +

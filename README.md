@@ -63,6 +63,7 @@ The goal is an agent at OpenClaw's level, only **fast and cheap**: one Node proc
 | **Autonomy and scheduling** | Wake-ups on its own initiative, cron schedules with a scripted check before the turn, quiet hours, mood and a daily summary. |
 | **Self-development** | Skills and experience review; a candidate in a separate worktree → deterministic gate in a sandbox → owner card → merge into main or roll back. |
 | **Built-in factory** | Heavy changes go through the factory inside the bot: analysis, test writer, executor, reviewer and a test gate in a separate worktree. The `zavod` tool files tasks there and shows their state. |
+| **Superagent runtime** | Optional full DeepSeek Superagent profiles for projects connected in `/factory`, with durable Telegram intake, separate sessions, GitHub sources and a local web panel. `/superagent projects` lists projects; `/superagent new <project> <task>` submits work. Runtime installation and GitHub authorization are separate prerequisites; see [runtime setup](integrations/superagent/UPSTREAM.md). |
 | **Security** | Command guard and sandboxes for `exec` and local `host_exec`, approvals that explain their purpose, secret masking, all external content reaching the model as data, budgets, panic stop, guests in their own sandbox. |
 | **Voice column** | An OpenAI-compatible `POST /v1/chat/completions` for the Xiaozhi speaker: its own context per device, without access to the owner's turns. |
 
@@ -97,8 +98,9 @@ flowchart LR
   PFX --> MODEL[DeepSeek model<br/>flash by default]
   MODEL -->|tool_use| TOOL{tool kind}
   TOOL -->|shell: exec · host_exec| GUARD{command guard<br/>deny · confirm · allow}
-  GUARD -->|allow| RUNTOOL[exec: bubblewrap sandbox<br/>host_exec: local read-only root or SSH]
-  GUARD -->|confirm| CARD[confirmation card<br/>with the reason]
+  GUARD -->|allow: exec or SSH| RUNTOOL[exec: bubblewrap sandbox<br/>host_exec: local read-only root or SSH]
+  GUARD -->|allow: local host_exec| CARD
+  GUARD -->|confirm| CARD[owner approval<br/>card or exact stored grant]
   GUARD -->|deny| MODEL
   CARD -->|Approve| RUNTOOL
   CARD -->|Deny| MODEL
@@ -122,13 +124,17 @@ flowchart TB
   CALL[Tool call from the model] --> KIND{tool kind}
   KIND -->|shell: exec · host_exec| G1[command guard<br/>deny · confirm · allow]
   G1 -->|exec| G2[exec sandbox<br/>bubblewrap without the owner HOME]
-  G1 -->|host_exec, local alias| H1[bubblewrap with a read-only root<br/>HOME readable, writes only to<br/>DSHBOT_HOME, /tmp, listed dirs]
+  G1 -->|host_exec, local alias: every command| HC[owner approval<br/>card or exact stored grant]
+  HC --> H1[bubblewrap with a read-only root<br/>HOME readable, writes only to<br/>DSHBOT_HOME, /tmp, listed dirs]
   G1 -->|host_exec, ssh alias| H2[SSH to the owner's host<br/>no sandbox there]
   KIND -->|fs · web · memory · MCP · others| P1[runs in the daemon<br/>access policy: allowed roots,<br/>hidden secret paths]
-  G2 --> G3[owner confirmation<br/>explicit card, no free-text yes]
-  H1 --> G3
-  H2 --> G3
-  P1 --> G3
+  G2 -->|when the guard requires| G3[owner confirmation<br/>explicit card, no free-text yes]
+  H1 --> G4
+  H2 -->|when the guard requires| G3
+  P1 -->|when policy requires| G3
+  G2 -->|allow| G4
+  H2 -->|allow| G4
+  P1 -->|allowed| G4
   G3 --> G4[secret masking<br/>env values and the secret store]
   G4 --> G5[untrusted content labels<br/>EXTERNAL_UNTRUSTED_CONTENT]
   G5 --> G6[guests in a separate sandbox<br/>no owner memory, files or tools]
@@ -206,7 +212,7 @@ Details: [docs/en/INSTALL.md](docs/en/INSTALL.md) ([по-русски](docs/INST
 
 ## Security model
 
-- **Sandbox first.** `exec` runs in bubblewrap without the owner's HOME or secrets. A local `host_exec` runs in bubblewrap over a read-only machine (HOME included) and can only write to `DSHBOT_HOME`, `/tmp` and explicitly listed directories; an SSH `host_exec` runs on the owner's host without a sandbox. Both pass the same command guard and confirmation cards as `exec`.
+- **Sandbox first.** `exec` runs in bubblewrap without the owner's HOME or secrets. A local `host_exec` runs in bubblewrap over a read-only machine (HOME included) and can only write to `DSHBOT_HOME`, `/tmp` and explicitly listed directories; an SSH `host_exec` runs on the owner's host without a sandbox. Every local `host_exec` command, including read-only checks and diagnostics, requires owner consent: a confirmation card or a previously granted permission for that exact host alias and command; guard denials still refuse execution. SSH keeps its existing guard and approval policy, and autonomous `exec` inside its sandbox is unchanged.
 - **Explicit approvals.** Irreversible or out-of-workspace actions need a Telegram card with a button; free text does not authorize them.
 - **Secrets stay out of tools.** Child processes get a cleaned environment, and stored secrets are masked in output and logs.
 - **External content is data.** Web, mail, MCP, command output and documents are framed as `EXTERNAL_UNTRUSTED_CONTENT`; the prompt forbids following instructions from that frame.

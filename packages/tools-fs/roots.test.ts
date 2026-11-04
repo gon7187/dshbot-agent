@@ -3,7 +3,7 @@
 // other. Overlapping roots never reveal the hidden trees (keys of the owner and
 // the private state of the bot) to read, list or grep.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, test } from 'vitest'
@@ -134,4 +134,17 @@ test('test_overlapping_roots_keep_the_hidden_trees_out_of_read_list_and_grep', a
   expect(String(await tool(GREP_TOOL_NAME).execute({ regex: 'NEEDLE', path: join(owner, '.config') }))).toContain(
     'NEEDLE in config',
   )
+})
+
+test('a symlinked list/grep base reports paths that read can actually open', async () => {
+  const file = join(workspace, 'nested', 'note.txt')
+  mkdirSync(join(workspace, 'nested'))
+  writeFileSync(file, 'ROUNDTRIP-NEEDLE\n')
+  const alias = join(workspace, 'alias')
+  symlinkSync('nested', alias)
+  const tool = toolsFor([])
+  expect(String(await tool(LIST_TOOL_NAME).execute({ path: alias }))).toContain(`Каталог: ${realpathSync(join(workspace, 'nested'))}`)
+  const found = String(await tool(GREP_TOOL_NAME).execute({ path: alias, regex: 'ROUNDTRIP-NEEDLE' }))
+  expect(found).toContain(`${file}:1:`)
+  expect(String(await tool(READ_TOOL_NAME).execute({ path: file }))).toContain('ROUNDTRIP-NEEDLE')
 })
