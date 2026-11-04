@@ -2,7 +2,7 @@
 //
 // The bot has its own factory inside the daemon (`packages/factory`), so the
 // tool talks to it in process: no external `zavod` CLI, no child process and no
-// watcher. The model creates and reads tasks; the owner's factory autopilot
+// watcher. The model creates, reads and manages tasks; the owner's factory autopilot
 // setting controls automatic approval and acceptance of low-risk work.
 
 import type { RunnerTool } from '../../runner/src/index.js'
@@ -16,12 +16,12 @@ import {
 export const ZAVOD_TOOL_NAME = 'zavod'
 
 /** Actions the model may perform. */
-export const ZAVOD_ACTIONS = ['new', 'status', 'show', 'help'] as const
+export const ZAVOD_ACTIONS = ['new', 'status', 'show', 'help', 'return', 'cancel', 'delete'] as const
 
 export type ZavodAction = (typeof ZAVOD_ACTIONS)[number]
 
 /** Decisions that exist only on the owner's cards in the built-in factory. */
-export const OWNER_DECISIONS = ['approve', 'accept', 'return', 'viewed', 'razbor'] as const
+export const OWNER_DECISIONS = ['approve', 'accept', 'viewed', 'razbor'] as const
 
 /** The part of one embedded factory task this tool reads. */
 export interface ZavodTask {
@@ -36,6 +36,8 @@ export interface ZavodTask {
   footprint: string[]
   risk?: string
   reason?: string
+  archived?: boolean
+  managementLog?: string
   progress?: { stage: string; round: number }
 }
 
@@ -50,6 +52,9 @@ export interface ZavodProject {
 /** The in-process factory seam supplied by `packages/app`. */
 export interface ZavodFactory {
   createTask(input: { text: string; title?: string; project?: string; requestId?: string }): ZavodTask
+  returnTask(id: number, remark: string): ZavodTask
+  cancelTask(id: number, reason: string): ZavodTask
+  deleteTask(id: number, reason: string): ZavodTask
   listTasks(): ZavodTask[]
   findTask(id: number): ZavodTask | undefined
   listProjects(): ZavodProject[]
@@ -74,16 +79,18 @@ const SHORT_DESCRIPTION =
   'сразу уходит в разбор и присылает владельцу карточку «Одобрить / Править / Отменить». ' +
   'request_id — необязательный ключ повтора: не выдумывай его, а при повторе того же вызова передай тот же ключ, ' +
   'и вернётся та же задача без второго разбора. ' +
-  'status — все задачи завода: номер, русский статус и название, у задачи в работе — этап и круг, ' +
+  'status — задачи завода без архива: номер, русский статус и название, у задачи в работе — этап и круг, ' +
   'у ждущей человека — причина ожидания, у задачи в очереди — что она ждёт очереди. ' +
   'show (id) — статус, критерии, footprint, риск, прогресс и причина, а также каких данных не хватает. ' +
   'Длинная причина сокращается; целиком — show с full: true. ' +
   'Включённый владельцем автопилот /factory сам одобряет и принимает задачи низкого риска после гейта и ревью. ' +
-  'У инструмента нет действий одобрения, приёмки и возврата; вручную они доступны на карточках /factory.'
+  'return (id, remark) возвращает ждущую приёмки задачу в работу; cancel (id, reason) отменяет свободную задачу; ' +
+  'delete (id, reason) скрывает завершённую задачу в архив, сохраняя результат и историю. Активный этап требует дождаться завершения. ' +
+  'approve и accept доступны только владельцу на карточках /factory.'
 
 /** Full guide of the `help` action: short enough to stay out of the prompt prefix. */
 export const ZAVOD_GUIDE = [
-  'Завод: как ставить задачи и смотреть их состояние.',
+  'Завод: постановка, состояние и управление задачами.',
   '',
   'У бота свой встроенный завод, он открывается командой владельца /factory. Внешний CLI zavod не нужен: ' +
     'инструмент работает с заводом внутри демона.',
@@ -106,7 +113,10 @@ export const ZAVOD_GUIDE = [
   '',
   'Решения владельца. Автопилот включается владельцем в /factory: задачи низкого риска проходят одобрение ' +
     'и приёмку автоматически после зелёного гейта и независимого ревью. Высокий риск и ошибки остаются владельцу. ' +
-    'Ручное одобрение, приёмка и возврат доступны на карточках. У инструмента нет действий approve, accept, return, viewed и razbor: такие вызовы отклоняются и ' +
+    'return (id, remark) возвращает ту же задачу с замечанием из приёмки в исполнение через обычный гейт и ревью. ' +
+    'cancel (id, reason) отменяет задачу, сохраняя результат и worktree. Активный разбор, исполнение или приёмка дают отказ: дождитесь завершения этапа. ' +
+    'delete (id, reason) архивирует только завершённую или отменённую задачу: она скрывается из status, но доступна через show, история и ключ повтора сохраняются. ' +
+    'У инструмента нет действий approve, accept, viewed и razbor: такие вызовы отклоняются и ' +
     'ничего не меняют в задаче.',
 ].join('\n')
 
@@ -236,6 +246,8 @@ function showText(task: ZavodTask, full: boolean): string {
     `Проект: ${task.projectName}`,
     `Статус: ${statusLabel(task.status)}`,
   ]
+  if (task.archived) lines.push('Архив: да')
+  if (hasText(task.managementLog)) lines.push('', `История управления: ${task.managementLog}`)
   if (hasText(task.risk)) lines.push(`Риск: ${task.risk}`)
   if (progress !== undefined) {
     lines.push(`Этап: ${stageLabel(progress.stage)}`)
@@ -267,7 +279,7 @@ export function createZavodTools(options: ZavodToolOptions): ZavodTools {
     if (action !== undefined && (OWNER_DECISIONS as readonly string[]).includes(action)) {
       throw new Error(
         `Отказ: действие ${action} — решение владельца на карточке встроенного завода /factory. ` +
-          'Инструмент zavod не выполняет approve, accept, return, viewed и razbor и ничего не меняет в задаче.',
+          'Инструмент zavod не выполняет approve, accept, viewed и razbor и ничего не меняет в задаче.',
       )
     }
     if (action === undefined || !(ZAVOD_ACTIONS as readonly string[]).includes(action)) {
@@ -298,6 +310,16 @@ export function createZavodTools(options: ZavodToolOptions): ZavodTools {
       return `Задача #${task.id} создана в проекте ${task.projectName} и отправлена на разбор.`
     }
 
+    if (action === 'return' || action === 'cancel' || action === 'delete') {
+      const id = idArg(args)
+      const task = action === 'return'
+        ? factory.returnTask(id, requiredString(args, 'remark', 'замечание'))
+        : action === 'cancel'
+          ? factory.cancelTask(id, requiredString(args, 'reason', 'причина'))
+          : factory.deleteTask(id, requiredString(args, 'reason', 'причина'))
+      return showText(task, false)
+    }
+
     if (action === 'status') {
       const tasks = factory.listTasks()
       if (tasks.length === 0) return 'Задач завода пока нет.'
@@ -320,7 +342,7 @@ export function createZavodTools(options: ZavodToolOptions): ZavodTools {
         action: {
           type: 'string',
           enum: [...ZAVOD_ACTIONS],
-          description: 'Что сделать: new, status, show или help.',
+          description: 'Что сделать: new, status, show, return, cancel, delete или help.',
         },
         text: { type: 'string', description: 'new: постановка задачи.' },
         title: { type: 'string', description: 'new: необязательный короткий заголовок.' },
@@ -334,7 +356,9 @@ export function createZavodTools(options: ZavodToolOptions): ZavodTools {
             'new: необязательный ключ повтора до 256 символов. Не выдумывай его; при повторе того же ' +
             'вызова передай тот же ключ — вернётся та же задача без второго разбора.',
         },
-        id: { type: 'number', description: 'show: номер задачи.' },
+        id: { type: 'number', description: 'show/return/cancel/delete: номер задачи.' },
+        remark: { type: 'string', description: 'return: обязательное замечание исполнителю, до 4000 символов.' },
+        reason: { type: 'string', description: 'cancel/delete: обязательная причина, до 4000 символов.' },
         full: { type: 'boolean', description: 'show: причина целиком, без сокращения длинного вывода гейта.' },
       },
       required: ['action'],

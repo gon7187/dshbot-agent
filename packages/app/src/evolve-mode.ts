@@ -201,19 +201,28 @@ export function formatEvolveStatus(state: EvolveModeState, now: number): string 
 }
 
 /**
- * The prompt of one autonomous cycle. It names the two steps of a small
- * self-fix, the factory tool for a big one, the silence token and the one
- * candidate rule; the model recognizes its situation from these words alone.
+ * The prompt of one autonomous cycle. It leads with the mandatory triage of
+ * the turn: every deviation the model noticed gets exactly one outcome (a fix
+ * now, a factory task through `zavod new`, or an explicit skip with a reason)
+ * and one notification line to the owner. Then come the two steps of a small
+ * self-fix, the factory rule with its `задача №N · что закроет` line, the one
+ * candidate rule, the owner-only bucket and the silence token. The triage and
+ * the notification line replace the old "choose one small self-fix" opening
+ * inside the same eight lines, and the result is shorter than the previous
+ * text, so the turn budget does not grow.
+ *
+ * Silence wins: notification lines exist only for deviations of this turn, so
+ * an empty cycle still answers exactly `[SILENT]` with no other lines.
  */
 export function evolveCyclePrompt(): string {
   return [
     '[ЦИКЛ САМОРАЗВИТИЯ]',
     'Автономный ход без задачи от владельца; режим саморазвития включён.',
-    'Выбери одну полезнейшую небольшую самоправку по свежему опыту: ошибки инструментов, отказы гейтов, жалобы владельца в истории, RUNTIME.md и доступные навыки.',
-    'Малая правка: self_change с кратким описанием, read и edit по абсолютному пути кандидата, затем self_submit с его id. Live-каталог не правь.',
-    'Большую или рискованную правку поручай заводу бота через zavod (действие new); коротко сообщи. Разбор придёт владельцу карточкой /factory, решение за ним.',
-    'Может быть только один открытый кандидат. Если он ждёт решения владельца по карточке, не вызывай self_change: сделай вывод из опыта и отчитайся. Если до карточки не дошёл (self_submit не вызван или гейт не прошёл), доведи его правками и self_submit либо убери через self_discard до нового кандидата.',
-    'Действия, требующие подтверждения владельца, сразу отклонят: не проси и не жди подтверждения. Карточка «Принять» от self_submit уходит владельцу как обычно, это не подтверждение хода; её решения не жди.',
+    'Каждое замеченное за этот ход отклонение (ошибки инструментов, отказы гейтов, жалобы владельца) получает ровно один исход: правка сейчас, задача завода через zavod new или явное «мимо» с причиной; по каждому — строка уведомления владельцу. Отклонений нет — строк нет, действует тишина.',
+    'Малая правка: self_change с описанием, read и edit по абсолютному пути кандидата, затем self_submit с его id. Live-каталог не правь.',
+    'Большую или рискованную правку поручай заводу через zavod new; в ответе владельцу обязательна строка «задача №N · что закроет», карточка разбора уйдёт владельцу сама.',
+    'Один открытый кандидат: если он ждёт решения владельца, не вызывай self_change, сделай вывод и отчитайся. Если self_submit не вызван или гейт не прошёл, доведи его правками либо убери через self_discard.',
+    'Подтверждения владельца не ждать: такие действия сразу отклонят. Деньги, ключи, аккаунты и данные владельца — всегда «мимо» с уведомлением.',
     'Отчитайся владельцу: что заметил, какую правку сделал или задачу поставил. Если улучшать нечего или сказать нечего, ответь ровно [SILENT]. Не переводи токен и не добавляй обычный ответ.',
   ].join('\n')
 }

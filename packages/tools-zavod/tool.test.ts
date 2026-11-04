@@ -42,6 +42,9 @@ beforeEach(() => { created.length = 0 })
 
 function factory(): ZavodFactory {
   return {
+    returnTask: () => { throw new Error('unused') },
+    cancelTask: () => { throw new Error('unused') },
+    deleteTask: () => { throw new Error('unused') },
     listTasks: () => tasks,
     findTask: (id) => tasks.find((task) => task.id === id),
     listProjects: () => projects,
@@ -68,7 +71,7 @@ test('new_creates_a_task_in_the_own_repository_and_returns_its_number', () => {
   expect(text).toContain('21')
   expect(created).toEqual([{ text: 'Показать пустой поиск.' }])
   expect(() => call({ action: 'new', project: 'missing', text: 'Task' })).toThrow()
-  for (const action of ['approve', 'accept', 'return', 'viewed', 'razbor']) expect(() => call({ action, id: 12 })).toThrow(/владельца/)
+  for (const action of ['approve', 'accept', 'viewed', 'razbor']) expect(() => call({ action, id: 12 })).toThrow(/владельца/)
   expect(created).toHaveLength(1)
 })
 
@@ -127,6 +130,7 @@ test('status_and_show_only_read_shared_factory_state_even_on_repeated_calls', ()
   }
   Object.freeze(state)
   const backend = {
+    ...factory(),
     listTasks: vi.fn(() => state),
     findTask: vi.fn((id: number) => state.find((task) => task.id === id)),
     listProjects: vi.fn(() => projects),
