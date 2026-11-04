@@ -49,7 +49,7 @@ export interface ZavodProject {
 
 /** The in-process factory seam supplied by `packages/app`. */
 export interface ZavodFactory {
-  createTask(input: { text: string; title?: string; project?: string }): ZavodTask
+  createTask(input: { text: string; title?: string; project?: string; requestId?: string }): ZavodTask
   listTasks(): ZavodTask[]
   findTask(id: number): ZavodTask | undefined
   listProjects(): ZavodProject[]
@@ -65,10 +65,15 @@ export interface ZavodTools {
   stop(): Promise<void>
 }
 
+/** Factory bound on a replay key: the same bound it validates in `createTask`. */
+const REQUEST_ID_MAX_LENGTH = 256
+
 const SHORT_DESCRIPTION =
   'Встроенный завод бота: поставить задачу и посмотреть её состояние. ' +
-  'new (text, необязательно title и project) создаёт задачу; по умолчанию в собственном репозитории бота, ' +
+  'new (text, необязательно title, project и request_id) создаёт задачу; по умолчанию в собственном репозитории бота, ' +
   'сразу уходит в разбор и присылает владельцу карточку «Одобрить / Править / Отменить». ' +
+  'request_id — необязательный ключ повтора: не выдумывай его, а при повторе того же вызова передай тот же ключ, ' +
+  'и вернётся та же задача без второго разбора. ' +
   'status — все задачи завода: номер, русский статус и название, у задачи в работе — этап и круг, ' +
   'у ждущей человека — причина ожидания, у задачи в очереди — что она ждёт очереди. ' +
   'show (id) — статус, критерии, footprint, риск, прогресс и причина, а также каких данных не хватает. ' +
@@ -86,6 +91,8 @@ export const ZAVOD_GUIDE = [
   'new. text — постановка: что сделать, зачем, границы. title — необязательный короткий заголовок; ' +
     'без него названием станет первая строка текста. project — необязательное имя подключённого проекта завода; ' +
     'без него задача создаётся в собственном репозитории бота. Неизвестный проект — ошибка со списком подключённых. ' +
+    'request_id — необязательный ключ повтора: не выдумывай его, а при повторе того же вызова передай тот же ключ, ' +
+    'и завод вернёт ту же задачу с тем же номером, не запуская второй разбор. ' +
     'Созданная задача сразу уходит в разбор, а владельцу приходит обычная карточка разбора.',
   '',
   'status. Все задачи завода, включая незавершённые: номер, статус теми же словами, что в меню /factory, ' +
@@ -114,6 +121,23 @@ function requiredString(args: Record<string, unknown>, name: string, what: strin
   const value = stringArg(args, name)
   if (value === undefined) throw new Error(`zavod: ${what} (${name}) обязателен.`)
   return value
+}
+
+/**
+ * The replay key, normalized the way the factory stores it. Unlike `stringArg`,
+ * a present but wrong value is an error: a silently dropped key would replay as
+ * a new task and a second analysis.
+ */
+function requestIdArg(args: Record<string, unknown>): string | undefined {
+  const raw = args.request_id
+  if (raw === undefined) return undefined
+  if (typeof raw !== 'string') throw new Error('zavod: request_id должен быть строкой.')
+  const requestId = raw.trim()
+  if (requestId === '') throw new Error('zavod: request_id не может быть пустым.')
+  if (requestId.length > REQUEST_ID_MAX_LENGTH) {
+    throw new Error(`zavod: request_id длиннее ${REQUEST_ID_MAX_LENGTH} символов.`)
+  }
+  return requestId
 }
 
 function idArg(args: Record<string, unknown>): number {
@@ -255,8 +279,11 @@ export function createZavodTools(options: ZavodToolOptions): ZavodTools {
       const text = requiredString(args, 'text', 'текст задачи')
       const title = stringArg(args, 'title')
       const project = stringArg(args, 'project')
-      const input: { text: string; title?: string; project?: string } = { text }
+      // Reject a bad replay key before any task exists, so a replay never dies as a duplicate.
+      const requestId = requestIdArg(args)
+      const input: { text: string; title?: string; project?: string; requestId?: string } = { text }
       if (title !== undefined) input.title = title
+      if (requestId !== undefined) input.requestId = requestId
       if (project !== undefined) {
         const connected = factory.listProjects()
         if (!connected.some((entry) => entry.name === project)) {
@@ -300,6 +327,12 @@ export function createZavodTools(options: ZavodToolOptions): ZavodTools {
         project: {
           type: 'string',
           description: 'new: имя подключённого проекта завода; без него — собственный репозиторий бота.',
+        },
+        request_id: {
+          type: 'string',
+          description:
+            'new: необязательный ключ повтора до 256 символов. Не выдумывай его; при повторе того же ' +
+            'вызова передай тот же ключ — вернётся та же задача без второго разбора.',
         },
         id: { type: 'number', description: 'show: номер задачи.' },
         full: { type: 'boolean', description: 'show: причина целиком, без сокращения длинного вывода гейта.' },
