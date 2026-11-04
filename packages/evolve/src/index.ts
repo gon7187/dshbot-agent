@@ -2059,14 +2059,15 @@ export function createEvolve(options: EvolveOptions): Evolve {
   }
 
   /**
-   * The gate of a synchronization candidate. It is the ordinary gate (tests in
-   * the sandbox and the review of the diff against live) with one deliberate
-   * difference: dependency files from origin/main are allowed and their
-   * dependencies are installed in the candidate before the tests.
+   * Exact fast-forwards of trusted main require full sandbox tests. Composed
+   * candidates also require diff review; changed dependencies are installed
+   * in the candidate before its tests.
    */
   async function gateSyncCandidate(candidate: Candidate, liveHead: string, installDeps: boolean, mainSha: string): Promise<string> {
     assertCandidateWorktree(candidate, live)
     const testedSha = await gitAsync(candidate.path, ['rev-parse', 'HEAD'])
+    const trustedFastForward = testedSha === mainSha &&
+      await tryGitAsync(candidate.path, ['merge-base', '--is-ancestor', liveHead, mainSha]) !== undefined
     await assertSyncSnapshot(candidate, testedSha, mainSha)
     if (installDeps) await installCandidateDependencies(candidate)
     await assertSyncSnapshot(candidate, testedSha, mainSha)
@@ -2074,7 +2075,7 @@ export function createEvolve(options: EvolveOptions): Evolve {
     const changed = (await gitAsync(candidate.path, ['diff', '--name-only', '-z', '--no-renames', liveHead]))
       .split('\0')
       .filter((path) => path !== '')
-    const gate = gateCommand(candidate.path, changed)
+    const gate = trustedFastForward ? { command: ['npm', 'test'], label: 'npm test' } : gateCommand(candidate.path, changed)
     const gitView = await createEngineeringGitView(candidate.path)
     let result: SandboxResult
     try {
@@ -2104,6 +2105,10 @@ export function createEvolve(options: EvolveOptions): Evolve {
     await assertSyncSnapshot(candidate, testedSha, mainSha)
     if (await tryGitAsync(candidate.path, ['merge-base', '--is-ancestor', mainSha, testedSha]) === undefined) {
       throw new Error('Гейт не пройден: кандидат синхронизации больше не основан на проверенном origin/main')
+    }
+    if (trustedFastForward) {
+      log(`sync review_skipped=trusted_main_fast_forward sha=${testedSha}; full sandbox npm test passed`)
+      return testedSha
     }
     const synced = (await gitAsync(candidate.path, ['diff', '--name-only', '-z', '--no-renames', liveHead, testedSha]))
       .split('\0').filter(path => path !== '')

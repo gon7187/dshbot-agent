@@ -40,9 +40,10 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }))
 function world(sandbox: SandboxRunner = () => ({ ok: true, status: 0, output: '' })) {
   const reviewer = vi.fn(async (_request: { model: string; prompt: string }) => JSON.stringify({ verdict: 'reject', summary: 'code rejected' }))
+  const gate = vi.fn(sandbox)
   const evolve = createEvolve({ home, live, ownerHome: root, review: { baseUrl: 'http://127.0.0.1:9', apiKey: 'unused' }, reviewer,
-    sandbox, card: async () => undefined, log: () => undefined })
-  return { evolve, reviewer }
+    sandbox: gate, card: async () => undefined, log: () => undefined })
+  return { evolve, reviewer, gate }
 }
 async function candidate(evolve: Evolve, description = 'edit files'): Promise<{ id: string; path: string }> {
   const start = evolve.tools.find((tool) => tool.name === 'self_change')!
@@ -63,7 +64,15 @@ function upstream(files: Record<string, string>): string {
   return git(origin, 'rev-parse', 'HEAD')
 }
 
+function ownCommit(): string {
+  put(join(live, 'packages/app/src/own.ts'), 'export const own = true\n')
+  git(live, 'add', '-A')
+  git(live, 'commit', '-q', '-m', 'evolve: own behavior')
+  return git(live, 'rev-parse', 'HEAD')
+}
+
 test('c5 synchronization reviews behavior and protected files; self changes reject protected and dependency files before review', async () => {
+  ownCommit()
   const paths = ['prompts/rules.md', 'persona/rules.md', 'CHARTER.md', 'CHECKLIST.md', 'scripts/example.sh', 'package.json']
   upstream(Object.fromEntries(paths.map((path, i) => [path, `SYNC_MARKER_${i}\n`])))
   const { evolve, reviewer } = world()
@@ -143,15 +152,26 @@ test('h3 deletion beneath a symlinked docs ancestor is reviewed in full', async 
 })
 
 
-test('sync review identifies verified main and live separately from autonomous self-change policy', async () => {
-  const liveSha = git(live, 'rev-parse', 'HEAD')
+test('canonical fast-forward uses full tests without LLM; replayed own changes retain mandatory review and self-change policy', async () => {
+  baseline({ 'package.json': '{"private":true,"scripts":{"gate":"node gate.js"}}\n' })
   const mainSha = upstream({
     'packages/evolve/src/example.ts': 'UPSTREAM_GATE_CODE\n',
     'packages/tools-exec/src/example.ts': 'UPSTREAM_SANDBOX_CODE\n',
-    'package.json': '{"private":true}\n',
     'CHECKLIST.md': 'CANDIDATE_POLICY_MUST_NOT_AUTHORIZE_REVIEW\n',
   })
-  const { evolve, reviewer } = world()
+  let testedSha = ''
+  const { evolve, reviewer, gate } = world((options) => {
+    testedSha = git(options.candidate, 'rev-parse', 'HEAD')
+    return { ok: true, status: 0, output: '' }
+  })
+  reviewer.mockRejectedValue(new Error('LLM must not gate exact trusted main'))
+  const canonical = await evolve.syncMain()
+  expect(canonical.state, JSON.stringify(canonical)).toBe('adopted')
+  expect(canonical.sha).toBe(mainSha)
+  expect(gate.mock.calls[0]![0].command).toEqual(['npm', 'test'])
+  expect(reviewer).not.toHaveBeenCalled()
+  rmSync(join(home, 'adopt.json'))
+  const liveSha = ownCommit()
   reviewer.mockResolvedValue(JSON.stringify({ verdict: 'reject', summary: 'sandbox would expose owner credentials' }))
   const refused = await evolve.syncMain()
   expect(refused.state).toBe('gate-failed')
@@ -163,16 +183,18 @@ test('sync review identifies verified main and live separately from autonomous s
   expect(prompt).toContain(liveSha)
   expect(prompt).toContain('UPSTREAM_GATE_CODE')
   expect(prompt).toContain('UPSTREAM_SANDBOX_CODE')
-  expect(gateEvidence(prompt)).toMatchObject({ mainSha, liveSha, candidateSha: mainSha,
-    gate: { command: ['npm', 'test'], status: 0, sandbox: true, testedSha: mainSha } })
+  expect(testedSha).not.toBe(mainSha)
+  expect(gateEvidence(prompt)).toMatchObject({ mainSha, liveSha, candidateSha: testedSha,
+    gate: { status: 0, sandbox: true, testedSha } })
   const policy = prompt.split('## Trusted sync-review checklist')[1]?.split('## ')[0]
   expect(policy).toBeTruthy()
   expect(policy).not.toContain('CANDIDATE_POLICY_MUST_NOT_AUTHORIZE_REVIEW')
   reviewer.mockResolvedValue(JSON.stringify({ verdict: 'approve', summary: 'reviewed main update' }))
   const accepted = await evolve.syncMain()
   expect(accepted.state, JSON.stringify(accepted)).toBe('adopted')
-  expect(accepted.sha).toBe(mainSha)
-  expect(JSON.parse(readFileSync(join(home, 'adopt.json'), 'utf8')).sha).toBe(mainSha)
+  expect(accepted.sha).toBe(testedSha)
+  expect(accepted.sha).not.toBe(mainSha)
+  expect(JSON.parse(readFileSync(join(home, 'adopt.json'), 'utf8')).sha).toBe(testedSha)
   reviewer.mockClear()
   reviewer.mockResolvedValue(JSON.stringify({ verdict: 'reject', summary: 'code rejected' }))
   const own = await candidate(evolve, 'sync-main origin/main: update controller')
@@ -237,7 +259,7 @@ test.each(['tracked', 'untracked', 'head'] as const)('sync rejects successful ga
 })
 
 test('sync rejects staged changes made during review before adoption', async () => {
-  const liveSha = git(live, 'rev-parse', 'HEAD')
+  const liveSha = ownCommit()
   upstream({ 'packages/app/src/example.ts': 'VERIFIED_SOURCE\n' })
   let candidatePath = ''
   const { evolve, reviewer } = world((options) => {
@@ -260,14 +282,18 @@ test('sync reviews complete bounded executable packets and every deletion; any r
     'packages/app/src/deleted.ts': 'DELETED_PRODUCTION_BODY\n',
     'tests/importable.test.ts': 'DELETED_IMPORTABLE_TEST_BODY\n',
   })
-  const liveSha = git(live, 'rev-parse', 'HEAD')
+  const liveSha = ownCommit()
   rmSync(join(origin, 'packages/app/src/deleted.ts'))
   rmSync(join(origin, 'tests/importable.test.ts'))
   const mainSha = upstream({
     'packages/app/src/a.ts': `//${'a'.repeat(105000)}\nexport const a = 'PACKET_A_TAIL'\n`,
     'packages/app/src/b.ts': `//${'b'.repeat(105000)}\nexport const b = 'PACKET_B_TAIL'\n`,
   })
-  const { evolve, reviewer } = world()
+  let testedSha = ''
+  const { evolve, reviewer } = world((options) => {
+    testedSha = git(options.candidate, 'rev-parse', 'HEAD')
+    return { ok: true, status: 0, output: '' }
+  })
   for (const rejected of ['PACKET_A_TAIL', 'PACKET_B_TAIL', null]) {
     reviewer.mockClear()
     const finding = 'Reviewed installer disables lifecycle scripts; preserve this verified finding across packets.'
@@ -309,13 +335,14 @@ test('sync reviews complete bounded executable packets and every deletion; any r
     expect(prompts.some((prompt) => prompt.includes('PACKET_A_TAIL') && prompt.includes('PACKET_B_TAIL'))).toBe(false)
     for (const prompt of prompts) {
       expect(prompt.length).toBeLessThanOrEqual(160000)
-      expect(gateEvidence(prompt)).toMatchObject({ mainSha, liveSha, candidateSha: mainSha,
-        gate: { status: 0, sandbox: true, testedSha: mainSha } })
+      expect(gateEvidence(prompt)).toMatchObject({ mainSha, liveSha, candidateSha: testedSha,
+        gate: { status: 0, sandbox: true, testedSha } })
     }
   }
 })
 
 test('sync fails closed for a single executable diff exceeding the complete prompt budget', async () => {
+  ownCommit()
   upstream({ 'packages/app/src/oversized.ts': `//${'x'.repeat(170000)}\nexport const end = 'OVERSIZED_TAIL'\n` })
   const { evolve, reviewer } = world()
   reviewer.mockResolvedValue(JSON.stringify({ verdict: 'approve', summary: 'approved' }))
@@ -333,6 +360,7 @@ test('sync lock packets preserve complete changed entries and metadata without u
   packages['node_modules/payload'] = oldEntry
   const lock = { name: 'fixture', version: '1.0.0', lockfileVersion: 3, packages }
   baseline({ 'package.json': '{"name":"fixture","version":"1.0.0","private":true}\n', 'package-lock.json': JSON.stringify(lock) })
+  ownCommit()
   const entry = { version: '2.0.0', resolved: 'https://untrusted.invalid/payload.tgz', hasInstallScript: true,
     bin: { payload: 'BIN_PAYLOAD_SENTINEL.js' }, unknownField: { marker: 'UNKNOWN_PACKAGE_FIELD' } }
   lock.packages['node_modules/payload'] = entry
@@ -349,7 +377,8 @@ test('sync lock packets preserve complete changed entries and metadata without u
     reviewer.mockResolvedValue(JSON.stringify({ verdict: 'approve', summary: 'approved' }))
     const result = await evolve.syncMain()
     expect(result.state, JSON.stringify(result)).toBe('adopted')
-    expect(result.sha).toBe(mainSha)
+    expect(result.sha).not.toBe(mainSha)
+    expect(git(live, 'merge-base', '--is-ancestor', mainSha, result.sha!)).toBe('')
     const prompts = reviewer.mock.calls.map(([request]) => request.prompt)
     expect(prompts.some((prompt) => prompt.includes('LOCK_UPDATE_RUNTIME_MARKER'))).toBe(true)
     const objects = prompts.flatMap((prompt) => [...prompt.matchAll(/```json\s*([\s\S]*?)```/g)].map((match) => JSON.parse(match[1]!)))

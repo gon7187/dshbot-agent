@@ -353,10 +353,16 @@ test.each(['submit', 'sync'] as const)('c1 c10 a changed module breaks its test:
   expect(outcome.passed, outcome.text).toBe(false)
   expect(outcome.text).toContain('src/math.test.ts')
   expect(outcome.text).toContain('AssertionError')
-  expect(outcome.text, 'the unrelated failing test was not part of this run').not.toContain('always-fails')
-  expect(testsRun()).toEqual(['src/math.test.ts'])
-  expect(outcome.text, 'npm test did not run, so the refusal must not name it').not.toMatch(RAN_NPM_TEST)
-  expect(outcome.text).toMatch(RAN_LIGHT_GATE)
+  if (path === 'sync') {
+    expect(outcome.text).toContain('always-fails.test.ts')
+    expect(testsRun()).toEqual(expect.arrayContaining(['src/math.test.ts', 'src/always-fails.test.ts']))
+    expect(outcome.text, 'trusted main fast-forward runs the full suite').toMatch(RAN_NPM_TEST)
+  } else {
+    expect(outcome.text, 'the unrelated failing test was not part of this run').not.toContain('always-fails')
+    expect(testsRun()).toEqual(['src/math.test.ts'])
+    expect(outcome.text, 'npm test did not run, so the refusal must not name it').not.toMatch(RAN_NPM_TEST)
+    expect(outcome.text).toMatch(RAN_LIGHT_GATE)
+  }
 })
 
 test('c2 a type error in a changed .ts file fails the gate with the tsc output', async () => {
