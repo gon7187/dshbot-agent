@@ -19,6 +19,9 @@ npm test        # tsc --noEmit, then vitest run
 
 There is no build step: vitest runs `.ts` files directly.
 
+The [core testing guide](docs/en/TESTING.md) describes the retained boundaries,
+focused runs and deliberate coverage limits.
+
 ## Repository layout
 
 - `packages/<name>/src/` — the package code.
