@@ -57,7 +57,7 @@ export const DEFAULT_PREFIX_BUDGET = 5000
  * §4 and §9). The generic default stays 5000 so unrelated callers keep the old
  * limit; the owner path names its own number explicitly.
  */
-export const OWNER_PREFIX_BUDGET = 6500
+export const OWNER_PREFIX_BUDGET = 4700
 
 /** Name of the working-rules file inside the persona directory. */
 export const RULES_FILE = 'rules.md'
@@ -89,7 +89,7 @@ export function loadRules(personaDir: string): string {
  * can review it in git and the evolve gate can change it like code. The file
  * is owner-only: `buildPrefix` carries it only when the caller passes it, and
  * the guest prefix never does. The owner's own non-empty
- * `DSHBOT_HOME/persona/character.md` is read by `loadOwnerCharacter` and wins.
+ * `DSHBOT_HOME/persona/character.md` is appended to it by `loadOwnerCharacter`.
  */
 export function characterPath(personaDir: string): string {
   return join(personaDir, CHARACTER_FILE)
@@ -104,19 +104,19 @@ export function loadCharacter(personaDir: string): string {
 export const HOME_PERSONA_DIR = 'persona'
 
 /**
- * Read the character the owner's prefix carries. A non-empty
- * `DSHBOT_HOME/persona/character.md` wins over the neutral repository file;
- * an absent or blank file falls back to `persona/character.md`. The result is
- * owner-only: the guest prefix is built from guest-only text and never calls
- * this loader.
+ * Read the character the owner's prefix carries: the neutral repository file,
+ * then a non-empty `DSHBOT_HOME/persona/character.md` as the owner's addendum.
+ * The addendum does not replace the repository text, so a change of
+ * `persona/character.md` reaches the owner even when the addendum exists. The
+ * result is owner-only: the guest prefix is built from guest-only text and
+ * never calls this loader.
  */
 export function loadOwnerCharacter(personaDir: string, homeDir: string): string {
+  const neutral = loadCharacter(personaDir)
   const ownPath = characterPath(join(homeDir, HOME_PERSONA_DIR))
-  if (existsSync(ownPath) && statSync(ownPath).isFile()) {
-    const own = readFileSync(ownPath, 'utf8')
-    if (own.trim() !== '') return own
-  }
-  return loadCharacter(personaDir)
+  if (!existsSync(ownPath) || !statSync(ownPath).isFile()) return neutral
+  const own = readFileSync(ownPath, 'utf8')
+  return own.trim() === '' ? neutral : `${neutral.trimEnd()}\n\n${own.trim()}\n`
 }
 
 // Explicitly marked so the model does not mistake reference data for a new owner

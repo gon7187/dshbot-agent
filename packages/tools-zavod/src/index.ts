@@ -2,11 +2,15 @@
 //
 // The bot has its own factory inside the daemon (`packages/factory`), so the
 // tool talks to it in process: no external `zavod` CLI, no child process and no
-// watcher. The owner's decisions stay on the factory cards in Telegram; the
-// model may only create a task and read it back.
+// watcher. The model creates and reads tasks; the owner's factory autopilot
+// setting controls automatic approval and acceptance of low-risk work.
 
 import type { RunnerTool } from '../../runner/src/index.js'
-import { FACTORY_STATUS_LABELS } from '../../factory/src/index.js'
+import {
+  FACTORY_MAX_ROUNDS,
+  FACTORY_STAGE_LABELS,
+  FACTORY_STATUS_LABELS,
+} from '../../factory/src/index.js'
 
 /** Tool name in the model schema. */
 export const ZAVOD_TOOL_NAME = 'zavod'
@@ -65,8 +69,12 @@ const SHORT_DESCRIPTION =
   'Встроенный завод бота: поставить задачу и посмотреть её состояние. ' +
   'new (text, необязательно title и project) создаёт задачу; по умолчанию в собственном репозитории бота, ' +
   'сразу уходит в разбор и присылает владельцу карточку «Одобрить / Править / Отменить». ' +
-  'status — задачи: номер, статус и название. show (id) — статус, критерии, footprint, риск, круг и причина. ' +
-  'Одобрение разбора, приёмка и возврат — только у владельца на карточках /factory; у инструмента таких действий нет.'
+  'status — все задачи завода: номер, русский статус и название, у задачи в работе — этап и круг, ' +
+  'у ждущей человека — причина ожидания, у задачи в очереди — что она ждёт очереди. ' +
+  'show (id) — статус, критерии, footprint, риск, прогресс и причина, а также каких данных не хватает. ' +
+  'Длинная причина сокращается; целиком — show с full: true. ' +
+  'Включённый владельцем автопилот /factory сам одобряет и принимает задачи низкого риска после гейта и ревью. ' +
+  'У инструмента нет действий одобрения, приёмки и возврата; вручную они доступны на карточках /factory.'
 
 /** Full guide of the `help` action: short enough to stay out of the prompt prefix. */
 export const ZAVOD_GUIDE = [
@@ -80,12 +88,18 @@ export const ZAVOD_GUIDE = [
     'без него задача создаётся в собственном репозитории бота. Неизвестный проект — ошибка со списком подключённых. ' +
     'Созданная задача сразу уходит в разбор, а владельцу приходит обычная карточка разбора.',
   '',
-  'status. Список задач завода: номер, статус теми же словами, что в меню /factory, и название.',
+  'status. Все задачи завода, включая незавершённые: номер, статус теми же словами, что в меню /factory, ' +
+    'и название. У задачи в работе тут же видны этап и круг исполнения, у ждущей человека — причина ожидания, ' +
+    'у задачи в очереди — что она ждёт очереди, у задачи на разборе — что идёт разбор. ' +
+    'Если прогресс или причина в задаче не записаны, status честно пишет, что они неизвестны.',
   '',
-  'show. id задачи: статус, критерии, footprint, риск, круг исполнения и причина, если задача ждёт человека.',
+  'show. id задачи: статус, критерии, footprint, риск, этап и круг исполнения и причина. ' +
+    'Длинная причина сокращается до первых 8 и последних 12 строк; full: true отдаёт её целиком. ' +
+    'Каких данных для диагностики не хватает, show перечисляет отдельно и не подставляет вместо них выдуманные значения.',
   '',
-  'Решения владельца. Одобрение разбора, приёмка и возврат делаются только кнопками на карточках встроенного ' +
-    'завода. У инструмента нет действий approve, accept, return, viewed и razbor: такие вызовы отклоняются и ' +
+  'Решения владельца. Автопилот включается владельцем в /factory: задачи низкого риска проходят одобрение ' +
+    'и приёмку автоматически после зелёного гейта и независимого ревью. Высокий риск и ошибки остаются владельцу. ' +
+    'Ручное одобрение, приёмка и возврат доступны на карточках. У инструмента нет действий approve, accept, return, viewed и razbor: такие вызовы отклоняются и ' +
     'ничего не меняют в задаче.',
 ].join('\n')
 
@@ -116,24 +130,107 @@ function statusLabel(status: string): string {
   return (FACTORY_STATUS_LABELS as Readonly<Record<string, string>>)[status] ?? status
 }
 
+function stageLabel(stage: string): string {
+  return (FACTORY_STAGE_LABELS as Readonly<Record<string, string>>)[stage] ?? stage
+}
+
+/** True when a field carries an actual value; a blank string explains nothing. */
+function hasText(value: string | undefined): value is string {
+  return value !== undefined && value.trim() !== ''
+}
+
+/** The recorded execution progress, or undefined when it is absent or incomplete. */
+function progressOf(task: ZavodTask): { stage: string; round: number } | undefined {
+  const progress = task.progress
+  if (progress === undefined) return undefined
+  if (typeof progress.stage !== 'string' || progress.stage.trim() === '') return undefined
+  if (!Number.isSafeInteger(progress.round) || progress.round <= 0) return undefined
+  return progress
+}
+
 /** `#12 ждёт одобрения Название` — the same words as the `/factory` menu. */
 function statusLine(task: ZavodTask): string {
   const title = task.title.trim() === '' ? '(без названия)' : task.title
   return `#${task.id} ${statusLabel(task.status)} ${title}`
 }
 
-function showText(task: ZavodTask): string {
+/** Extra lines of the status list: where an unfinished task actually stands. */
+function statusDetails(task: ZavodTask): string[] {
+  const progress = progressOf(task)
+  switch (task.status) {
+    case 'incoming':
+      return ['ждёт начала разбора']
+    case 'analysis':
+      return ['идёт разбор: анализ задачи ещё не закончен']
+    case 'awaiting_approval':
+      return ['разбор готов: ждёт одобрения владельца на карточке /factory']
+    case 'queued':
+      return ['ждёт очереди: исполнитель ещё не взял задачу в работу']
+    case 'running':
+      return progress === undefined
+        ? ['прогресс неизвестен: завод не сообщил ни этап, ни круг исполнения']
+        : [`этап: ${stageLabel(progress.stage)}, круг ${progress.round} из ${FACTORY_MAX_ROUNDS}`]
+    case 'awaiting_human':
+      return hasText(task.reason)
+        ? [`причина: ${shortenReason(task.reason.trim(), { full: false, taskId: task.id })}`]
+        : ['причина неизвестна: завод не записал, почему задача ждёт человека']
+    case 'merged':
+      return ['влито: задача завершена']
+    case 'rejected':
+      return ['отклонено: задача завершена']
+    default:
+      return []
+  }
+}
+
+/** One line per task plus, where it helps, the same facts show prints. */
+function statusEntry(task: ZavodTask): string {
+  const details = statusDetails(task)
+  if (details.length === 0) return statusLine(task)
+  return [statusLine(task), ...details.map((line) => `  ${line}`)].join('\n')
+}
+
+export const REASON_HEAD_LINES = 8
+export const REASON_TAIL_LINES = 12
+
+/** Keep the verdict and the final error while bounding repeated gate output. */
+export function shortenReason(reason: string, options: { full: boolean; taskId: number }): string {
+  const lines = reason.split('\n')
+  const keep = REASON_HEAD_LINES + REASON_TAIL_LINES
+  if (options.full || lines.length <= keep) return reason
+  return [
+    ...lines.slice(0, REASON_HEAD_LINES),
+    `…обрезано ${lines.length - keep} строк из ${lines.length}; целиком — zavod show с id ${options.taskId} и full: true`,
+    ...lines.slice(-REASON_TAIL_LINES),
+  ].join('\n')
+}
+
+function showText(task: ZavodTask, full: boolean): string {
+  const progress = progressOf(task)
   const lines = [
     `Задача #${task.id}: ${task.title}`,
     `Проект: ${task.projectName}`,
     `Статус: ${statusLabel(task.status)}`,
   ]
-  if (task.risk !== undefined) lines.push(`Риск: ${task.risk}`)
-  if (task.progress !== undefined) lines.push(`Круг: ${task.progress.round}`)
+  if (hasText(task.risk)) lines.push(`Риск: ${task.risk}`)
+  if (progress !== undefined) {
+    lines.push(`Этап: ${stageLabel(progress.stage)}`)
+    lines.push(`Круг: ${progress.round} из ${FACTORY_MAX_ROUNDS}`)
+  }
   if (task.criteria.length > 0) lines.push('', 'Критерии:', ...task.criteria.map((item) => `- ${item}`))
-  else lines.push('', 'Критерии: пока нет (задача ещё не разобрана).')
+  else lines.push('', 'Критерии: в задаче не указаны.')
   if (task.footprint.length > 0) lines.push('', 'Footprint:', ...task.footprint.map((item) => `- ${item}`))
-  if (task.reason !== undefined && task.reason.trim() !== '') lines.push('', `Причина: ${task.reason}`)
+  else lines.push('', 'Footprint: в задаче не указан.')
+  if (hasText(task.reason)) lines.push('', `Причина: ${shortenReason(task.reason.trim(), { full, taskId: task.id })}`)
+
+  const missing: string[] = []
+  if (!hasText(task.reason)) {
+    missing.push('- причина (reason): завод не записал, почему задача ждёт или что решил владелец')
+  }
+  if (progress === undefined) {
+    missing.push('- прогресс (progress): завод не записал этап и круг исполнения')
+  }
+  if (missing.length > 0) lines.push('', 'Чего не хватает для диагностики:', ...missing)
   return lines.join('\n')
 }
 
@@ -177,14 +274,14 @@ export function createZavodTools(options: ZavodToolOptions): ZavodTools {
     if (action === 'status') {
       const tasks = factory.listTasks()
       if (tasks.length === 0) return 'Задач завода пока нет.'
-      return tasks.map(statusLine).join('\n')
+      return tasks.map(statusEntry).join('\n')
     }
 
     // show
     const id = idArg(args)
     const task = factory.findTask(id)
     if (task === undefined) throw new Error(`Задача не найдена: #${id}.`)
-    return showText(task)
+    return showText(task, args.full === true)
   }
 
   const tool: RunnerTool = {
@@ -205,6 +302,7 @@ export function createZavodTools(options: ZavodToolOptions): ZavodTools {
           description: 'new: имя подключённого проекта завода; без него — собственный репозиторий бота.',
         },
         id: { type: 'number', description: 'show: номер задачи.' },
+        full: { type: 'boolean', description: 'show: причина целиком, без сокращения длинного вывода гейта.' },
       },
       required: ['action'],
     },

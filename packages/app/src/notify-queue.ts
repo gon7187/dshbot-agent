@@ -16,8 +16,14 @@
 //   по источникам; первое обнаружение сохраняется в `.json.seen`, файлы
 //   переименовываются только после успешной сводки;
 // - ошибка Telegram оставляет `.json` на месте, следующий опрос повторит;
-// - отчёт версии 3 раскладывается на сообщения по блокам, отчёт версии 2
-//   показывается как обычная карточка.
+// - короткие карточки одного источника, пришедшие за один проход, уходят
+//   одной сводкой: сборщик чата кладёт карточку на каждое сообщение, и
+//   отдельное сообщение на каждую превращается в поток из десятков;
+// - блоки отчёта версии 3 собираются в сообщения по лимиту текста, а не по
+//   блоку; отчёт версии 2 показывается как обычная карточка;
+// - картинка не уходит отдельным сообщением: она вкладывается в тело того же
+//   rich-сообщения (`<img src="tg://photo?id=...">` плюс файл в
+//   `rich_message.media`); если rich не принят, текст и фото идут по-старому.
 
 import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -485,6 +491,49 @@ function cardText(card: NotifyCard): NotifyFragment[] {
   return fragments
 }
 
+/**
+ * Строка сводки из текста карточки: переносы схлопываются в разделитель,
+ * потому что у карточки чата первая строка — «От: кто», а сам текст ниже,
+ * и обрезка по первой строке потеряла бы смысл уведомления.
+ */
+function digestLine(text: string, limit = 180): string {
+  const flat = text
+    .split('\n')
+    .map((item) => item.trim())
+    .filter((item) => item !== '')
+    .join(' · ')
+  return flat.length <= limit ? flat : `${flat.slice(0, limit - 1)}…`
+}
+
+/** Слово «уведомление» в нужном числе для заголовка сводки. */
+function notificationWord(count: number): string {
+  const tail = count % 100
+  const last = count % 10
+  if (last === 1 && tail !== 11) return 'уведомление'
+  if (last >= 2 && last <= 4 && (tail < 12 || tail > 14)) return 'уведомления'
+  return 'уведомлений'
+}
+
+/**
+ * Сводка пачки коротких карточек: заголовок, название источника и по одной
+ * строке каждого уведомления. Задача сводки — не потерять ни одного
+ * уведомления и не утопить владельца в сообщениях; полный текст каждого
+ * остаётся в почте и чате, откуда пришла карточка.
+ */
+function digestFragments(cards: readonly NotifyCard[]): NotifyFragment[] {
+  const source = cards[0]?.source ?? ''
+  const fragments: NotifyFragment[] = [
+    { text: `${cards.length} ${notificationWord(cards.length)}`, style: 'bold' },
+  ]
+  if (source !== '') fragments.push({ text: ` · ${source}`, style: 'plain' })
+  for (const card of cards) {
+    fragments.push({ text: '\n• ', style: 'plain' }, { text: card.title, style: 'bold' })
+    const line = digestLine(card.summary)
+    if (line !== '') fragments.push({ text: ` — ${line}`, style: 'plain' })
+  }
+  return fragments
+}
+
 /** Текст ячейки без оформления: в pre вложенные теги Telegram не принимает. */
 function cellText(cell: readonly NotifyFragment[]): string {
   return cell.map((fragment) => fragment.text).join('')
@@ -592,6 +641,55 @@ function packTable(lines: string[]): string[] {
   return messages
 }
 
+/** Картинка, вложенная в тело rich-сообщения. */
+interface InlineMedia {
+  id: string
+  name: string
+  data: Uint8Array
+  contentType: string
+}
+
+/** Разметка ссылается на файл из `rich_message.media` по этому идентификатору. */
+const INLINE_PHOTO_SRC = 'tg://photo?id='
+
+/** Тег картинки в теле: нужен, чтобы откат ушёл без висячей ссылки. */
+const INLINE_PHOTO_TAG = /<img src="tg:\/\/photo\?id=[A-Za-z0-9_-]+"\/>\n?/g
+
+/**
+ * Отправляет одно rich-сообщение с картинками в теле. Разметка ссылается на
+ * файл как `<img src="tg://photo?id=<id>"/>`, сами файлы уходят в
+ * `rich_message.media`. Ошибка не глотается: вызывающий решает, как откатиться.
+ */
+async function sendRichHtml(
+  api: TelegramApi,
+  chatId: number,
+  html: string,
+  media: readonly InlineMedia[],
+): Promise<void> {
+  const files: Record<string, { name: string; data: Uint8Array; contentType: string }> = {}
+  for (const item of media) {
+    files[item.id] = { name: item.name, data: item.data, contentType: item.contentType }
+  }
+  await api.call(
+    'sendRichMessage',
+    {
+      chat_id: chatId,
+      rich_message: {
+        html,
+        media: media.map((item) => ({ id: item.id, media: { type: 'photo', media: `attach://${item.id}` } })),
+      },
+    },
+    files,
+  )
+}
+
+/** Одна картинка отдельным сообщением: путь отката, когда rich не принят. */
+async function sendImage(api: TelegramApi, chatId: number, item: InlineMedia): Promise<void> {
+  await api.call('sendPhoto', { chat_id: chatId }, {
+    photo: { name: item.name, data: item.data, contentType: item.contentType },
+  })
+}
+
 async function sendPhoto(
   api: TelegramApi,
   chatId: number,
@@ -620,23 +718,70 @@ async function deliverReport(
   artifactsDir: string,
 ): Promise<void> {
   const blocks = card.blocks ?? []
-  await sendFragments(api, chatId, cardText(card))
+  // Блоки копятся в одном сообщении до лимита текста: отчёт из десяти коротких
+  // блоков — это одно сообщение, а не десять. Картинки вкладываются в тело
+  // того же сообщения и уходят вместе с ним одним sendRichMessage.
+  let pending: string[] = []
+  let pendingLength = 0
+  let media: InlineMedia[] = []
+  let photoCount = 0
+  const flush = async (): Promise<void> => {
+    if (pending.length === 0) return
+    const html = pending.join('\n')
+    const images = media
+    pending = []
+    pendingLength = 0
+    media = []
+    if (images.length === 0) {
+      await sendText(api, chatId, html)
+      return
+    }
+    try {
+      await sendRichHtml(api, chatId, html, images)
+    } catch {
+      // Rich не принят: текст уходит как раньше, картинки — отдельными
+      // сообщениями. Владелец видит всё, просто не одним сообщением; карточка
+      // считается доставленной и на повтор не остаётся.
+      const plain = html.replace(INLINE_PHOTO_TAG, '').trim()
+      if (plain !== '') await sendText(api, chatId, plain)
+      for (const item of images) await sendImage(api, chatId, item)
+    }
+  }
+  const push = async (html: string): Promise<void> => {
+    if (html === '') return
+    if (pendingLength > 0 && pendingLength + html.length + 1 > NOTIFY_TEXT_LIMIT) await flush()
+    pending.push(html)
+    pendingLength += html.length + 1
+  }
+  const pushFragments = async (fragments: readonly NotifyFragment[]): Promise<void> => {
+    for (const chunk of chunkAtoms(atomsOf(fragments), NOTIFY_TEXT_LIMIT)) await push(atomsToHtml(chunk))
+  }
+
+  await pushFragments(cardText(card))
   for (const block of blocks) {
     if (block.kind === 'heading' || block.kind === 'paragraph') {
-      await sendFragments(api, chatId, block.text)
+      await pushFragments(block.text)
       continue
     }
     if (block.kind === 'photo') {
-      await sendPhoto(api, chatId, artifactsDir, block.artifactId, block.caption)
+      // Картинка встаёт в тело того же сообщения: файл уйдёт вместе с текстом,
+      // подпись — обычным блоком под картинкой.
+      const id = `photo${photoCount + 1}`
+      const data = readFileSync(join(artifactsDir, `${block.artifactId}.png`))
+      photoCount += 1
+      media.push({ id, name: `${block.artifactId}.png`, data, contentType: 'image/png' })
+      await push(`<img src="${INLINE_PHOTO_SRC}${id}"/>`)
+      if (block.caption.length > 0) await pushFragments(block.caption)
       continue
     }
     if (block.kind === 'table') {
-      for (const message of packTable(tableLines(block))) await sendText(api, chatId, message)
-      if (block.caption.length > 0) await sendFragments(api, chatId, block.caption)
+      for (const message of packTable(tableLines(block))) await push(message)
+      if (block.caption.length > 0) await pushFragments(block.caption)
       continue
     }
-    await sendFragments(api, chatId, [{ text: DIVIDER, style: 'plain' }])
+    await pushFragments([{ text: DIVIDER, style: 'plain' }])
   }
+  await flush()
 }
 
 async function deliverCard(
@@ -650,7 +795,20 @@ async function deliverCard(
     return
   }
   if (card.artifact !== undefined) {
-    await sendPhoto(api, chatId, artifactsDir, card.artifact.id, cardText(card))
+    // Карточка с картинкой тоже идёт одним сообщением: текст и картинка в теле.
+    const item: InlineMedia = {
+      id: 'photo1',
+      name: `${card.artifact.id}.png`,
+      data: readFileSync(join(artifactsDir, `${card.artifact.id}.png`)),
+      contentType: 'image/png',
+    }
+    const html = `${atomsToHtml(atomsOf(cardText(card)))}\n<img src="${INLINE_PHOTO_SRC}${item.id}"/>`
+    try {
+      await sendRichHtml(api, chatId, html, [item])
+    } catch {
+      // Прежний путь: подпись к фото отдельным сообщением.
+      await sendPhoto(api, chatId, artifactsDir, card.artifact.id, cardText(card))
+    }
     return
   }
   await sendFragments(api, chatId, cardText(card))
@@ -851,17 +1009,54 @@ export function createNotifyQueue(deps: NotifyQueueDeps): NotifyQueue {
       }
     }
 
+    // Сборщик чата кладёт карточку на каждое сообщение, и за один проход их
+    // может быть больше десятка. Идущие подряд короткие карточки одного
+    // источника уходят одной сводкой; отчёты и карточки с картинкой — по
+    // одной, как раньше.
+    let batch: Array<{ name: string; card: NotifyCard }> = []
+    let batchSource = ''
+
+    const flushBatch = async (): Promise<boolean> => {
+      if (batch.length === 0) return true
+      const entries = batch
+      batch = []
+      batchSource = ''
+      const first = entries[0]
+      if (first === undefined) return true
+      try {
+        if (entries.length === 1) await deliverCard(deps.api, chatId, first.card, artifactsDir)
+        else await sendFragments(deps.api, chatId, digestFragments(entries.map((entry) => entry.card)))
+      } catch (error) {
+        deps.log(`notify-queue: сводка из ${entries.length} карточек не отправлена: ${describeError(error)}`)
+        return false
+      }
+      for (const entry of entries) accept(entry.name)
+      deps.onDelivered?.(chatId)
+      return true
+    }
+
     for (const entry of fresh) {
       if (stopped) return
-      try {
-        await deliverCard(deps.api, chatId, entry.card, artifactsDir)
-      } catch (error) {
-        deps.log(`notify-queue: карточка ${entry.name} не отправлена: ${describeError(error)}`)
-        return
+      const plain = entry.card.blocks === undefined && entry.card.artifact === undefined
+      if (!plain) {
+        if (!(await flushBatch())) return
+        try {
+          await deliverCard(deps.api, chatId, entry.card, artifactsDir)
+        } catch (error) {
+          deps.log(`notify-queue: карточка ${entry.name} не отправлена: ${describeError(error)}`)
+          return
+        }
+        accept(entry.name)
+        deps.onDelivered?.(chatId)
+        continue
       }
-      accept(entry.name)
-      deps.onDelivered?.(chatId)
+      if (batch.length > 0 && batchSource !== entry.card.source) {
+        if (!(await flushBatch())) return
+      }
+      batch.push({ name: entry.name, card: entry.card })
+      batchSource = entry.card.source
     }
+    if (!(await flushBatch())) return
   }
 
   async function tick(): Promise<void> {

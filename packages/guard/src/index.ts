@@ -5,7 +5,7 @@
 // command classification, protected-path checks and the panic exit code.
 
 import { realpathSync } from 'node:fs'
-import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 /** Exit code used by /panic: systemd is configured not to restart on it. */
 export const PANIC_EXIT_CODE = 77
@@ -1502,24 +1502,25 @@ function readBacktick(text: string, start: number): { value: string; end: number
 }
 
 /** Text of the parenthesised substitution whose body starts at `start`, and its end index. */
-function readParens(text: string, start: number): { value: string; end: number } {
-  let value = ''
+function readParens(text: string, start: number, collapseWrappers = false): { value: string; end: number } {
   let depth = 1
   let quote: '"' | "'" | 'ansi' | null = null
+  let wrappers = 0
+  if (collapseWrappers) {
+    for (let at = start; text.startsWith('$(', at) && text[at + 2] !== '('; at += 2) wrappers += 1
+  }
+  const closes = wrappers === 0 ? undefined : new Array<number>(wrappers + 2)
 
   for (let i = start; i < text.length; i += 1) {
     const ch = text[i]
 
     if (quote === "'") {
-      value += ch
       if (ch === "'") quote = null
       continue
     }
 
     if (quote === 'ansi') {
-      value += ch
       if (ch === '\\' && i + 1 < text.length) {
-        value += text[i + 1]
         i += 1
       } else if (ch === "'") {
         quote = null
@@ -1528,9 +1529,7 @@ function readParens(text: string, start: number): { value: string; end: number }
     }
 
     if (quote === '"') {
-      value += ch
       if (ch === '\\' && i + 1 < text.length) {
-        value += text[i + 1]
         i += 1
       } else if (ch === '"') {
         quote = null
@@ -1540,40 +1539,43 @@ function readParens(text: string, start: number): { value: string; end: number }
 
     if (ch === '$' && text[i + 1] === "'") {
       quote = 'ansi'
-      value += ch + text[i + 1]
       i += 1
       continue
     }
 
     if (ch === "'" || ch === '"') {
       quote = ch
-      value += ch
       continue
     }
 
     if (ch === '\\' && i + 1 < text.length) {
-      value += ch + text[i + 1]
       i += 1
       continue
     }
 
     if (ch === '(') {
       depth += 1
-      value += ch
       continue
     }
 
     if (ch === ')') {
+      if (closes !== undefined && depth < closes.length && closes[depth] === undefined) closes[depth] = i
       depth -= 1
-      if (depth === 0) return { value, end: i }
-      value += ch
+      if (depth === 0) {
+        let from = start
+        let end = i
+        // Only a complete substitution wrapping the entire body has no own command to classify.
+        for (let level = 2; closes !== undefined && level < closes.length && closes[level] === end - 1; level += 1) {
+          from += 2
+          end -= 1
+        }
+        return { value: text.slice(from, end), end: i }
+      }
       continue
     }
-
-    value += ch
   }
 
-  return { value, end: text.length - 1 }
+  return { value: text.slice(start), end: text.length - 1 }
 }
 
 /**
@@ -1646,7 +1648,7 @@ function nestedSubstitutions(text: string): string[] {
     if ((ch === '$' || (quote === null && (ch === '<' || ch === '>'))) && text[i + 1] === '(') {
       // `$((…))` is arithmetic expansion: it runs no command.
       if (ch === '$' && text[i + 2] === '(') continue
-      const read = readParens(text, i + 2)
+      const read = readParens(text, i + 2, ch === '$')
       found.push(read.value)
       i = read.end
     }
@@ -1973,6 +1975,44 @@ function ghFinding(args: string[], partText: string): Finding | null {
   return null
 }
 
+/**
+ * Whether a raw shell word is a path the classifier can trust as a directory:
+ * literal characters and double-quoted substrings whose only expansions are
+ * `$name` or `${name}`. Anything else (command substitution, `$@`, arrays,
+ * parameter operators, an unquoted `$`) may change what the word means.
+ */
+const GIT_DIRECTORY_WORD = /^(?:[A-Za-z0-9_./~+=:,@%-]|"(?:[A-Za-z0-9_./~+=:,@%-]|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})*")+$/
+
+/**
+ * Argument offsets that hold the value of the global `git -C`. A directory is
+ * never a flag, so a plain variable there does not hide anything the
+ * classifier judges; the subcommand after it is still classified as usual.
+ * `-C` after the subcommand is a different option and is not listed.
+ */
+function gitDirectoryValueOffsets(args: string[], words: string[], expands: boolean[], first: number): Set<number> {
+  const offsets = new Set<number>()
+  let i = 0
+  while (i < args.length) {
+    const token = args[i]
+    if (token === '-C' && !expands[first + i]) {
+      const word = words[first + i + 1]
+      if (word !== undefined && GIT_DIRECTORY_WORD.test(word)) offsets.add(i + 1)
+      i += 2
+      continue
+    }
+    if (token === '-c' || token === '--git-dir' || token === '--work-tree') {
+      i += 2
+      continue
+    }
+    if (token.startsWith('-')) {
+      i += 1
+      continue
+    }
+    break
+  }
+  return offsets
+}
+
 function gitSubcommand(args: string[]): string | undefined {
   let i = 0
   while (i < args.length) {
@@ -1999,7 +2039,12 @@ function nestedArguments(command: string, args: string[]): string[] {
 
   if (SHELLS.has(command)) {
     const flagIndex = args.findIndex((token) => /^-[A-Za-z]*c[A-Za-z]*$/.test(token))
-    if (flagIndex !== -1) found.push(args.slice(flagIndex + 1).join(' '))
+    if (flagIndex !== -1) {
+      let start = flagIndex + 1
+      // Plain shell/-c pairs carry no expansion, redirection or finding of their own.
+      while (SHELLS.has(args[start]) && args[start + 1] === '-c') start += 2
+      found.push(args.slice(start).join(' '))
+    }
   }
 
   if (command === 'eval') found.push(args.join(' '))
@@ -2231,12 +2276,21 @@ function classifyOwn(part: ShellPart, sandbox: boolean, nested: string[]): Findi
     }
   }
 
+  // The value of a global `git -C` is a directory, never a flag, so a plain
+  // variable there is not a reason for a card. It is judged on the raw words,
+  // which exist only when they line up one to one with the tokens.
+  const directoryValues =
+    command === 'git' && part.words.length === tokens.length
+      ? gitDirectoryValueOffsets(args, part.words, expands, index + 1)
+      : new Set<number>()
+  const argExpands = (offset: number): boolean => expandsAt(index + 1 + offset) && !directoryValues.has(offset)
+
   // Commands that accept flags or actions after operands are sensitive to a
   // variable anywhere in their arguments: GNU rm takes flags after operands
   // (`rm build $FLAGS`) and find takes actions after paths (`find . $ARGS`).
   if (
     VARIABLE_SENSITIVE_COMMANDS.has(command) &&
-    args.some((_token, offset) => expandsAt(index + 1 + offset))
+    args.some((_token, offset) => argExpands(offset))
   ) {
     return {
       verdict: 'confirm',
@@ -2250,7 +2304,7 @@ function classifyOwn(part: ShellPart, sandbox: boolean, nested: string[]): Findi
   // lone operand such as `echo $HOME` stays allowed. In the sandbox this is
   // not a reason for a card: the command can only touch the workspace and the
   // owner's read-write roots.
-  const variableIndex = args.findIndex((_token, offset) => expandsAt(index + 1 + offset))
+  const variableIndex = args.findIndex((_token, offset) => argExpands(offset))
   if (
     !sandbox &&
     variableIndex !== -1 &&
@@ -2415,9 +2469,16 @@ const PROTECTED_DIRECTORIES = [
   // factory, otherwise a self-rewrite candidate could open the host while keeping
   // the gate green.
   'packages/tools-exec',
+  // Superagent process, transport and startup boundaries must not rewrite themselves.
+  'packages/superagent',
+  'integrations/superagent',
   'deploy',
   'tests/character',
   'scripts',
+  // The GitHub runner steps are not code the bot runs, so the review does not
+  // judge them (see the evolve review scope); the self-rewrite must not change
+  // them at all.
+  '.github',
 ]
 
 function isWithin(relativePath: string, directory: string): boolean {
@@ -2454,20 +2515,31 @@ function realPathOf(path: string): string {
  * True when `path` points at a path the bot may not edit on its own:
  * `CHARTER.md`, `CHECKLIST.md`, anything under `packages/guard/`,
  * `packages/evolve/` (the self-rewrite gate), `packages/tools-exec/` (the exec
- * sandbox), `deploy/`, `tests/character/` or the adoption/rollback scripts in
- * `scripts/`.
+ * sandbox), `deploy/`, `tests/character/`, `.github/` or the adoption/rollback
+ * scripts in `scripts/`.
  *
  * Relative paths are resolved against `repoRoot`; paths outside `repoRoot`
- * are never protected. Symlinks are resolved to their real targets first, so a
- * link inside the repo cannot be used to reach a protected path. Letter case is
- * ignored, so a case variant does not slip past on a case-insensitive
- * filesystem (on a case-sensitive one it is a different, harmless path).
+ * are never protected. A path is protected when either of two independent
+ * checks says so: its place in the repository as written (lexical, no symlink
+ * resolved in any component, so a link in a protected directory cannot move it
+ * out of sight) or its fully resolved real target (so a link cannot reach a
+ * protected path from outside). Letter case is ignored, so a case variant does
+ * not slip past on a case-insensitive filesystem (on a case-sensitive one it is
+ * a different, harmless path).
  */
 export function isProtected(path: string, repoRoot: string): boolean {
+  const lexicalRoot = resolve(repoRoot)
   const root = realPathOf(repoRoot)
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(root, path)
-  const real = realPathOf(absolute)
-  const relativePath = relative(root, real)
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(lexicalRoot, path)
+  return (
+    isProtectedUnder(lexicalRoot, absolute) ||
+    isProtectedUnder(root, absolute) ||
+    isProtectedUnder(root, realPathOf(absolute))
+  )
+}
+
+function isProtectedUnder(root: string, resolved: string): boolean {
+  const relativePath = relative(root, resolved)
 
   if (relativePath.length === 0) return false
   if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {

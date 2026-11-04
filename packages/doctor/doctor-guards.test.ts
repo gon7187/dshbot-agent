@@ -1,9 +1,6 @@
-// Guards of the recovery doctor that recovery.test.ts does not reach: quoting
-// tricks around the read-only list, normalized paths and the bwrap sandbox for
-// confirmed commands, masking of every env-file value, and the exit while a
-// confirmed command is still running.
+// Own recovery command policy, credential redaction and standalone lifecycle.
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -27,94 +24,6 @@ function object(value: unknown): Obj {
 function quote(path: string): string {
   return `'${path.replaceAll("'", "'\\''")}'`
 }
-
-test('read-only list rejects quoting, escapes, abbreviations and option tricks', () => {
-  for (const command of [
-    'journalctl --user -u dshbot.service -n 30 --no-pager',
-    'journalctl -xeu dshbot.service',
-    'journalctl --user -n5',
-    'systemctl --user status dshbot.service',
-    'systemctl --user is-active dshbot.service',
-    'git status',
-    'git -C app log --oneline -5',
-    'cat diagnostic.txt',
-    'ls -la',
-    'tail -n 1 diagnostic.txt',
-    'grep marker diagnostic.txt',
-    'cat stderr-fixture/*',
-  ]) {
-    expect(isReadOnly(command), command).toBe(true)
-  }
-  for (const command of [
-    'git log "--output=/home/doctor-review-victim"',
-    "git log '--output=/home/doctor-review-victim'",
-    'git log \\--output=/home/doctor-review-victim',
-    'git log --output=/home/doctor-review-victim',
-    'git log --out=/home/doctor-review-victim',
-    'git log --outp=victim',
-    'git -c core.pager=touch log',
-    'git --git-dir=/elsewhere log',
-    'journalctl "--rotate"',
-    "journalctl '--vacuum-size=1'",
-    'journalctl --rotate',
-    'journalctl --rot',
-    'journalctl --vacuum-time=1s',
-    'journalctl --flush',
-    'journalctl --cursor-file=cursor',
-    'journalctl -u dshbot.service --vacuum-files=1',
-    'journalctl *',
-    'git log *',
-    'systemctl --user restart dshbot.service',
-    'systemctl --user start dshbot.service',
-    'systemctl --user "status" dshbot.service',
-    'systemctl --user status dshbot.service --now',
-    'cat diagnostic.txt > copy.txt',
-    'cat $HOME/x',
-    'ls; touch x',
-    'FOO=1 cat x',
-    './cat x',
-    '/tmp/x/cat x',
-    'cat a\nrm -rf b',
-  ]) {
-    expect(isReadOnly(command), command).toBe(false)
-  }
-})
-
-test('confirmed paths are normalized before the root check', () => {
-  const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'dshbot-doctor-paths-')))
-  try {
-    const home = join(scratch, 'home')
-    mkdirSync(home)
-    expect(unsafePathReason('printf changed > //home/doctor-review-victim', home)).toBeDefined()
-    expect(unsafePathReason('printf changed >//etc/doctor-review-victim', home)).toBeDefined()
-    expect(unsafePathReason('printf changed > /tmp/../home/doctor-review-victim', home)).toBeDefined()
-    expect(unsafePathReason(`printf ok > ${quote(join(home, 'inside.txt'))}`, home)).toBeUndefined()
-    expect(unsafePathReason(`printf ok > ${quote(join(scratch, 'tmp.txt'))}`, home)).toBeUndefined()
-  } finally {
-    rmSync(scratch, { recursive: true, force: true })
-  }
-})
-
-test('the runtime value of every env-file name is masked, whatever its name or length', () => {
-  const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'dshbot-doctor-env-')))
-  try {
-    const file = join(scratch, 'dshbot.env')
-    writeFileSync(file, '# comment\nCUSTOM_VALUE=file-only\nAPI_TOKEN=abc\nQUOTED="two words"\nEMPTY=\n')
-    const names = readEnvFileNames(file)
-    expect(names).toEqual(['CUSTOM_VALUE', 'API_TOKEN', 'QUOTED', 'EMPTY'])
-    expect(readEnvFileNames(join(scratch, 'missing.env'))).toEqual([])
-    const clean = createScrubber({ CUSTOM_VALUE: 'demo-secret', API_TOKEN: 'abc', QUOTED: 'two words', OTHER: 'public' }, names)
-    const masked = clean('custom demo-secret token abc quoted two words, other public, file file-only')
-    for (const secret of ['demo-secret', 'abc', 'two words']) expect(masked).not.toContain(secret)
-    expect(masked).toContain('[скрыто]')
-    // Only process values are masked: the file's own text is not a secret source.
-    expect(masked).toContain('public')
-    expect(masked).toContain('file-only')
-    expect(clean('nothing to hide')).toBe('nothing to hide')
-  } finally {
-    rmSync(scratch, { recursive: true, force: true })
-  }
-})
 
 interface TgCall { method: string; params: Obj; id: number }
 
@@ -150,9 +59,10 @@ class World {
   seq = 0
 
   /** `exported` stands for what systemd puts into the process from the env-file. */
-  async start(envFile = '', exported: NodeJS.ProcessEnv = {}): Promise<void> {
+  async start(envFile = '', exported: NodeJS.ProcessEnv = {}, isolation = true): Promise<void> {
     mkdirSync(this.home, { recursive: true })
     mkdirSync(this.bin)
+    if (!isolation) writeFileSync(join(this.bin, 'bwrap'), '#!/bin/sh\nexit 1\n', { mode: 0o755 })
     mkdirSync(join(this.userHome, '.config/dshbot'), { recursive: true })
     writeFileSync(join(this.userHome, '.config/dshbot/dshbot.env'), envFile)
     const db = new DatabaseSync(join(this.home, 'state.db'))
@@ -209,8 +119,7 @@ console.log(state); process.exit(state === 'active' ? 0 : 3);
       DSHBOT_HOME: this.home,
       TELEGRAM_BOT_TOKEN: TOKEN,
       DEEPSEEK_API_KEY: KEY,
-      // These guards measure the post-window doctor; the grace window is
-      // covered by restart-grace-window.test.ts.
+      // Start the recovery path without waiting through the restart grace window.
       DSHBOT_DOCTOR_GRACE_MS: '1',
       TELEGRAM_API_ROOT: `${await origin(tg)}/tg`,
       DEEPSEEK_BASE_URL: `${await origin(model)}/anthropic`,
@@ -278,71 +187,130 @@ console.log(state); process.exit(state === 'active' ? 0 : 3);
 let world: World | undefined
 afterEach(async () => { await world?.close(); world = undefined })
 
-test('confirmed commands run in a sandbox: no write outside DSHBOT_HOME and /tmp via //, variables or cd', { timeout: 60_000 }, async () => {
-  const w = world = new World()
-  await w.start()
-  const inside = join(w.home, 'inside.txt')
-  let at = w.seq
-  const ok = w.plan([`printf inside > ${quote(inside)}`])
-  await w.allow(at)
-  await w.wait('confirmed write inside DSHBOT_HOME', () => w.text().includes(`answer-${ok}`))
-  expect(readFileSync(inside, 'utf8'), 'the sandbox keeps DSHBOT_HOME writable').toBe('inside')
+test('D1 command and output-path tricks require consent; approved roots remain usable', () => {
+  for (const command of ['git status', 'cat diagnostic.txt']) {
+    expect(isReadOnly(command), command).toBe(true)
+  }
+  for (const command of [
+    'git log "--output=/home/doctor-review-victim"',
+    'git log \\--output=/home/doctor-review-victim',
+    'git log --out=/home/doctor-review-victim',
+    'git -c core.pager=touch log',
+    'journalctl "--rotate"',
+    'git log *',
+    'systemctl --user restart dshbot.service',
+    'cat diagnostic.txt > copy.txt',
+    'cat $HOME/x',
+    'ls; touch x',
+    'FOO=1 cat x',
+    './cat x',
+  ]) {
+    expect(isReadOnly(command), command).toBe(false)
+  }
 
-  // A writable directory outside /tmp: /tmp itself is an allowed root.
+  const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'dshbot-doctor-paths-')))
+  try {
+    const home = join(scratch, 'home')
+    mkdirSync(home)
+    expect(unsafePathReason('printf changed > //home/doctor-review-victim', home)).toBeDefined()
+    expect(unsafePathReason('printf changed >//etc/doctor-review-victim', home)).toBeDefined()
+    expect(unsafePathReason('printf changed > /tmp/../home/doctor-review-victim', home)).toBeDefined()
+    expect(unsafePathReason(`printf ok > ${quote(join(home, 'inside.txt'))}`, home)).toBeUndefined()
+    expect(unsafePathReason(`printf ok > ${quote(join(scratch, 'tmp.txt'))}`, home)).toBeUndefined()
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+})
+test('D2 every configured runtime env value is masked, including short and neutral names', () => {
+  const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'dshbot-doctor-env-')))
+  try {
+    const file = join(scratch, 'dshbot.env')
+    writeFileSync(file, '# comment\nCUSTOM_VALUE=file-only\nAPI_TOKEN=abc\nQUOTED="two words"\nEMPTY=\n')
+    const names = readEnvFileNames(file)
+    expect(names).toEqual(['CUSTOM_VALUE', 'API_TOKEN', 'QUOTED', 'EMPTY'])
+    expect(readEnvFileNames(join(scratch, 'missing.env'))).toEqual([])
+    const clean = createScrubber({ CUSTOM_VALUE: 'demo-secret', API_TOKEN: 'abc', QUOTED: 'two words', OTHER: 'public' }, names)
+    const masked = clean('custom demo-secret token abc quoted two words, other public, file file-only')
+    for (const secret of ['demo-secret', 'abc', 'two words']) expect(masked).not.toContain(secret)
+    expect(masked).toContain('[скрыто]')
+    // Only process values are masked: the file's own text is not a secret source.
+    expect(masked).toContain('public')
+    expect(masked).toContain('file-only')
+    expect(clean('nothing to hide')).toBe('nothing to hide')
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+})
+test('D3 standalone doctor requires owner consent, enforces isolation and kills command on recovery', { timeout: 60_000 }, async () => {
+  const w = world = new World()
+  await w.start('CUSTOM_VALUE=demo-secret\nAPI_TOKEN=abc\n', { CUSTOM_VALUE: 'demo-secret', API_TOKEN: 'abc' })
+  writeFileSync(join(w.home, 'diagnostic.txt'), 'visible-line\ndemo-secret\nabc\n')
+  const read = w.plan(['cat diagnostic.txt'])
+  await w.wait('read-only result', () => w.text().includes(`answer-${read}`))
+  expect(w.text()).toContain('visible-line')
+  for (const secret of ['demo-secret', 'abc']) {
+    expect(JSON.stringify(w.calls)).not.toContain(secret)
+    expect(JSON.stringify(w.modelBodies)).not.toContain(secret)
+  }
+  const inside = join(w.home, 'inside.txt')
+  const first = w.seq
+  const positive = w.plan([`printf inside > ${quote(inside)}`])
+  await w.wait('owner confirmation', () => w.card(first) !== undefined)
+  expect(existsSync(inside)).toBe(false)
+  const pollsBeforeStranger = w.calls.filter(call => call.method === 'getUpdates').length
+  w.push({ callback_query: { id: 'wrong-owner', from: { id: OWNER + 1, is_bot: false }, data: w.card(first), message: { message_id: 1, chat: { id: OWNER, type: 'private' } } } })
+  await w.wait('stranger update consumed', () => w.calls.filter(call => call.method === 'getUpdates').length > pollsBeforeStranger)
+  expect(existsSync(inside)).toBe(false)
+  await w.allow(first)
+  await w.wait('approved write', () => w.text().includes(`answer-${positive}`))
+  expect(readFileSync(inside, 'utf8')).toBe('inside')
   const outside = realpathSync(mkdtempSync(join(root, '.doctor-guard-')))
   w.outside.push(outside)
   const victim = join(outside, 'keep.txt')
-  writeFileSync(victim, 'protected-original')
-  // Octal escapes keep every `/` of the path out of the command text, so only
-  // the sandbox can stop these writes.
-  const hidden = `'${[...outside].map((char) => `\\${char.charCodeAt(0).toString(8).padStart(3, '0')}`).join('')}'`
-  expect(hidden).not.toContain('/')
-  for (const command of [
-    `printf changed > /${victim}`,
-    `D=$(printf ${hidden}); printf changed > "$D/keep.txt"`,
-    `cd "$(printf ${hidden})" && printf changed > keep.txt`,
-    `cd "$(printf ${hidden})" && rm -f keep.txt`,
-  ]) {
-    at = w.seq
-    const marker = w.plan([command])
-    await w.wait('refusal or card', () => w.text().includes(`answer-${marker}`) || w.card(at) !== undefined)
-    if (w.card(at) !== undefined) await w.allow(at)
-    await w.wait(`answer for ${command}`, () => w.text().includes(`answer-${marker}`))
-    expect(existsSync(victim), command).toBe(true)
-    expect(readFileSync(victim, 'utf8'), command).toBe('protected-original')
-  }
-})
-
-test('main unit recovery kills a running confirmed command and exits within 30 s', { timeout: 60_000 }, async () => {
-  const w = world = new World()
-  await w.start()
+  writeFileSync(victim, 'original')
+  const hidden = "'" + [...outside].map(char => '\\' + char.charCodeAt(0).toString(8).padStart(3, '0')).join('') + "'"
+  const guardAt = w.seq
+  const denied = w.plan([`D=$(printf ${hidden}); printf changed > "$D/keep.txt"`])
+  await w.allow(guardAt)
+  await w.wait('sandbox result', () => w.text().includes(`answer-${denied}`))
+  expect(readFileSync(victim, 'utf8')).toBe('original')
   const started = join(w.home, 'started.txt')
   const late = join(w.home, 'late.txt')
   const at = w.seq
-  w.plan([`printf started > ${quote(started)}; sleep 8; printf late > ${quote(late)}`])
+  w.plan([`printf started > ${quote(started)}; sleep 60; printf late > ${quote(late)}`])
   await w.allow(at)
   await w.wait('the confirmed command is running', () => existsSync(started))
+  // bwrap has a PID namespace: capture host PIDs from /proc rather than shell $$.
+  const commandPids = readdirSync('/proc').filter(name => /^\d+$/.test(name)).flatMap(name => {
+    try {
+      const cmdline = readFileSync(`/proc/${name}/cmdline`, 'utf8')
+      return cmdline.includes(started) && /(?:bwrap|bash)\0/.test(cmdline) ? [Number(name)] : []
+    } catch { return [] }
+  })
+  expect(commandPids.length).toBeGreaterThan(0)
+  for (const pid of commandPids) expect(readFileSync(`/proc/${pid}/stat`, 'utf8')).not.toMatch(/\) Z /)
   const becameActive = Date.now()
   writeFileSync(w.state, 'active')
   await w.wait('doctor exits while the command runs', () => w.exited, 30_000)
   expect(Date.now() - becameActive).toBeLessThan(30_000)
   expect(w.exitCode, w.output).toBe(0)
   const polls = w.calls.filter((call) => call.method === 'getUpdates').length
-  await sleep(9_000)
+  await w.wait('command processes terminated', () => commandPids.every(pid => {
+    try { return /\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')) } catch { return true }
+  }), 2_000, true)
   expect(existsSync(late), 'the command did not outlive the doctor').toBe(false)
   expect(w.calls.filter((call) => call.method === 'getUpdates')).toHaveLength(polls)
-})
 
-test('short and neutrally named env-file values never reach the owner or the model', { timeout: 40_000 }, async () => {
+})
+test('D4 unavailable isolation refuses all bash while recovery monitoring remains alive', { timeout: 30_000 }, async () => {
   const w = world = new World()
-  await w.start('CUSTOM_VALUE=demo-secret\nAPI_TOKEN=abc\n', { CUSTOM_VALUE: 'demo-secret', API_TOKEN: 'abc' })
-  writeFileSync(join(w.home, 'diagnostic.txt'), 'visible-line\ndemo-secret\nabc\n')
-  const marker = w.plan(['cat diagnostic.txt'])
-  await w.wait('model answer', () => w.text().includes(`answer-${marker}`))
-  expect(w.text()).toContain('visible-line')
-  expect(w.text()).toContain('[скрыто]')
-  for (const secret of ['demo-secret', 'abc']) {
-    expect(JSON.stringify(w.calls.map((call) => call.params)), secret).not.toContain(secret)
-    expect(JSON.stringify(w.modelBodies), secret).not.toContain(secret)
-  }
+  await w.start('', {}, false)
+  const marker = w.plan(['cat diagnostic.txt', 'printf forbidden > forbidden.txt'])
+  await w.wait('failed closed answer', () => w.text().includes(`answer-${marker}`))
+  expect(w.text()).toMatch(/bwrap/i)
+  expect(w.card(0)).toBeUndefined()
+  expect(existsSync(join(w.home, 'forbidden.txt'))).toBe(false)
+  writeFileSync(w.state, 'active')
+  await w.wait('recovery monitor exits without sandbox', () => w.exited, 15_000)
+  expect(w.exitCode).toBe(0)
 })

@@ -16,8 +16,9 @@ import type { DatabaseSync } from 'node:sqlite'
 
 import { claim } from './claim.js'
 import { nextRun, parseSchedule } from './schedule.js'
-import { assertTimeZone, ownerTimeZone } from './timezone.js'
+import { assertTimeZone, DAY_MS, ownerTimeZone } from './timezone.js'
 import type { Schedule } from './types.js'
+import { isSilent } from './wake.js'
 
 /** Migration namespace of the schedules table inside the shared store database. */
 export const SCHEDULER_NAMESPACE = 'scheduler'
@@ -80,6 +81,32 @@ const SCHEDULER_STEPS: readonly string[] = [
   `ALTER TABLE schedules ADD COLUMN watch_command TEXT`,
   `ALTER TABLE schedules ADD COLUMN watch_pattern TEXT`,
   `ALTER TABLE schedules ADD COLUMN watch_window_sec INTEGER`,
+  // One light row per real run for the weekly summary. schedule_runs keeps only
+  // the last 20 runs of a job, so the counts of a frequent job need their own
+  // table; rows older than the summary window are dropped on every write. The
+  // same step copies the runs already saved (skips excluded), once.
+  `CREATE TABLE IF NOT EXISTS schedule_run_tally (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    error TEXT NOT NULL
+  );
+  INSERT INTO schedule_run_tally (job_id, started_at, kind, error)
+  SELECT job_id, started_at,
+    CASE
+      WHEN status = 'error' THEN 'error'
+      WHEN trim(output, ' ' || char(9) || char(10) || char(13)) = '' THEN 'empty'
+      WHEN trim(output, ' ' || char(9) || char(10) || char(13)) = '[SILENT]' THEN 'silent'
+      ELSE 'text'
+    END,
+    CASE WHEN status = 'error' THEN output ELSE '' END
+  FROM schedule_runs WHERE status != 'skip' ORDER BY id`,
+  `CREATE INDEX IF NOT EXISTS schedule_run_tally_job_idx ON schedule_run_tally (job_id, started_at)`,
+  // The reasoning effort of the planned turn. A row without one runs at the
+  // level it ran at before the column existed. Migrations are counted by index,
+  // so this step stays last.
+  `ALTER TABLE schedules ADD COLUMN effort TEXT`,
 ]
 
 /** How many last real (ok and error) runs of a job `schedule history` and the table keep. */
@@ -95,6 +122,9 @@ export const SCHEDULE_SKIP_LIMIT = 200
 /** How many latest skips `schedule history` shows next to the real runs. */
 export const SCHEDULE_HISTORY_SKIP_LIMIT = 20
 
+/** The window of {@link ScheduleRegistry.summary}, in days. */
+export const SCHEDULE_SUMMARY_DAYS = 7
+
 /** How much of the output of one run is kept. */
 export const SCHEDULE_RUN_OUTPUT_LIMIT = 300
 
@@ -106,6 +136,24 @@ export const MIN_WATCH_WINDOW_SEC = 1
 
 /** Largest accepted batch window of a stream watcher, in seconds. */
 export const MAX_WATCH_WINDOW_SEC = 86_400
+
+/** Reasoning efforts a job may ask for: the levels of the model of planned turns. */
+export const SCHEDULE_EFFORTS = ['off', 'low', 'high', 'max'] as const
+
+/** One accepted reasoning effort of a job. */
+export type ScheduleEffort = (typeof SCHEDULE_EFFORTS)[number]
+
+/**
+ * Accepted effort of a raw value (case and edge spaces ignored); a refusal
+ * naming the allowed levels otherwise, so nothing is saved with a wrong one.
+ */
+function checkEffort(value: unknown, action: 'create' | 'update'): ScheduleEffort {
+  const level = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  if ((SCHEDULE_EFFORTS as readonly string[]).includes(level)) return level as ScheduleEffort
+  throw new Error(
+    `schedule ${action}: неизвестный уровень effort ${JSON.stringify(value)}. Допустимы: ${SCHEDULE_EFFORTS.join(', ')}.`,
+  )
+}
 
 /** One saved job as the rest of the daemon sees it. */
 export interface ScheduleRecord {
@@ -143,6 +191,12 @@ export interface ScheduleRecord {
    */
   agent: string | null
   /**
+   * Reasoning effort of the planned turn, for this turn only; null keeps the
+   * level the turn had without a job effort (the owner's `/effort` for `main`,
+   * the profile default for a profile).
+   */
+  effort: ScheduleEffort | null
+  /**
    * Incremented by pause, resume and update. A claimed batch remembers the
    * generation it reserved; a mismatch means the reservation is stale.
    */
@@ -162,6 +216,21 @@ export interface ScheduleRun {
 
 /** `skip` is a scheduled tick whose check reported no work; every tick gets its own row. */
 export type ScheduleRunStatus = 'ok' | 'error' | 'skip'
+
+/** What one real run produced: text for the owner, the silent token, nothing, or a failure. */
+export type ScheduleRunKind = 'text' | 'silent' | 'empty' | 'error'
+
+/** Runs of one job over the last {@link SCHEDULE_SUMMARY_DAYS} days, by kind. */
+export interface ScheduleSummary {
+  id: string
+  task: string
+  text: number
+  silent: number
+  empty: number
+  error: number
+  /** Output of the latest failed run; null when no run failed in the window. */
+  lastError: string | null
+}
 
 export interface RecordScheduleRunInput {
   jobId: string
@@ -183,6 +252,8 @@ export interface UpdateScheduleInput {
   deliver?: ScheduleDelivery
   /** Named agent profile of the planned turn; omitted keeps `main`. */
   agent?: string
+  /** Reasoning effort of the planned turn; omitted keeps the stored one, `''` clears it. */
+  effort?: string
   /** Fields of a stream watcher; omitted fields keep their stored value. */
   watch?: Partial<ScheduleWatch>
 }
@@ -218,6 +289,8 @@ export interface CreateScheduleInput {
   deliver?: ScheduleDelivery
   /** Named agent profile whose instructions, tools and model run the turn. */
   agent?: string
+  /** Reasoning effort of the planned turn; omitted keeps the turn's usual level. */
+  effort?: string
   /**
    * A stream watcher instead of a timed job: a long command runs in the exec
    * sandbox and its matching lines are delivered to the owner. A watcher row
@@ -288,6 +361,16 @@ export interface ScheduleRegistry {
    * {@link SCHEDULE_HISTORY_SKIP_LIMIT} skips, newest first.
    */
   history(id: string): ScheduleRun[]
+  /**
+   * For every saved job, its real runs of the last {@link SCHEDULE_SUMMARY_DAYS}
+   * days by kind. Unlike {@link history} it counts every run of the window.
+   */
+  summary(): ScheduleSummary[]
+  /**
+   * Failed runs at the end of the job's history, skips ignored: the length of
+   * the current failure series, at most {@link SCHEDULE_RUNS_LIMIT}.
+   */
+  failureStreak(id: string): number
 }
 
 interface ScheduleRow {
@@ -309,6 +392,7 @@ interface ScheduleRow {
   paused: number | null
   generation: number | null
   agent: string | null
+  effort: string | null
   watch_command: string | null
   watch_pattern: string | null
   watch_window_sec: number | null
@@ -356,6 +440,7 @@ function toRecord(row: ScheduleRow): ScheduleRecord {
     lastSkipAt: row.last_skip_at === null ? null : new Date(row.last_skip_at),
     paused: (row.paused ?? 0) !== 0,
     agent: typeof row.agent === 'string' && row.agent !== '' ? row.agent : null,
+    effort: (SCHEDULE_EFFORTS as readonly (string | null)[]).includes(row.effort) ? (row.effort as ScheduleEffort) : null,
     generation: row.generation ?? 0,
     watch:
       typeof row.watch_command === 'string' &&
@@ -495,7 +580,7 @@ export function createScheduleRegistry(
   const db = storage.db
   const COLUMNS =
     'id, spec, schedule, task, idle_only, next_run_at, created_at, last_error, tz, until_at, max_runs, runs, ' +
-    'check_command, deliver, last_skip_at, paused, generation, agent, watch_command, watch_pattern, watch_window_sec'
+    'check_command, deliver, last_skip_at, paused, generation, agent, effort, watch_command, watch_pattern, watch_window_sec'
   const selectAll = db.prepare(`SELECT ${COLUMNS} FROM schedules ORDER BY created_at, id`)
   const selectOne = db.prepare(`SELECT ${COLUMNS} FROM schedules WHERE id = ?`)
   const selectDue = db.prepare(
@@ -503,8 +588,8 @@ export function createScheduleRegistry(
      FROM schedules WHERE next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at, created_at, id`,
   )
   const insert = db.prepare(
-    `INSERT INTO schedules (id, spec, schedule, task, idle_only, next_run_at, created_at, last_error, tz, until_at, max_runs, runs, check_command, deliver, last_skip_at, agent, watch_command, watch_pattern, watch_window_sec)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?)`,
+    `INSERT INTO schedules (id, spec, schedule, task, idle_only, next_run_at, created_at, last_error, tz, until_at, max_runs, runs, check_command, deliver, last_skip_at, agent, effort, watch_command, watch_pattern, watch_window_sec)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?)`,
   )
   const removeStatement = db.prepare('DELETE FROM schedules WHERE id = ?')
   const advance = db.prepare(
@@ -518,7 +603,7 @@ export function createScheduleRegistry(
   )
   const updateRow = db.prepare(
     'UPDATE schedules SET spec = ?, schedule = ?, task = ?, idle_only = ?, tz = ?, until_at = ?, max_runs = ?, ' +
-      'check_command = ?, deliver = ?, agent = ?, next_run_at = ?, last_error = NULL, generation = generation + 1 ' +
+      'check_command = ?, deliver = ?, agent = ?, effort = ?, next_run_at = ?, last_error = NULL, generation = generation + 1 ' +
       'WHERE id = ?',
   )
   // A watcher keeps next_run_at NULL: only the command, the expression, the
@@ -526,7 +611,7 @@ export function createScheduleRegistry(
   // supervised process with the new command.
   const updateWatchRow = db.prepare(
     'UPDATE schedules SET spec = ?, task = ?, watch_command = ?, watch_pattern = ?, watch_window_sec = ?, ' +
-      'deliver = ?, next_run_at = NULL, last_error = NULL, generation = generation + 1 WHERE id = ?',
+      'deliver = ?, effort = ?, next_run_at = NULL, last_error = NULL, generation = generation + 1 WHERE id = ?',
   )
   const insertRun = db.prepare(
     'INSERT INTO schedule_runs (job_id, started_at, duration_ms, status, output) VALUES (?, ?, ?, ?, ?)',
@@ -544,6 +629,16 @@ export function createScheduleRegistry(
     `DELETE FROM schedule_runs WHERE job_id = ? AND status = 'skip' AND id NOT IN (
        SELECT id FROM schedule_runs WHERE job_id = ? AND status = 'skip' ORDER BY id DESC LIMIT ${SCHEDULE_SKIP_LIMIT}
      )`,
+  )
+  const insertTally = db.prepare(
+    'INSERT INTO schedule_run_tally (job_id, started_at, kind, error) VALUES (?, ?, ?, ?)',
+  )
+  const trimTally = db.prepare('DELETE FROM schedule_run_tally WHERE started_at < ?')
+  const selectTally = db.prepare(
+    'SELECT job_id, kind, COUNT(*) AS n FROM schedule_run_tally WHERE started_at >= ? GROUP BY job_id, kind',
+  )
+  const selectLastError = db.prepare(
+    "SELECT job_id, error FROM schedule_run_tally WHERE kind = 'error' AND started_at >= ? ORDER BY started_at, id",
   )
   const selectRealRuns = db.prepare(
     'SELECT id, job_id, started_at, duration_ms, status, output FROM schedule_runs WHERE job_id = ? ' +
@@ -583,6 +678,7 @@ export function createScheduleRegistry(
     }
     const agent = typeof input.agent === 'string' ? input.agent.trim() : ''
     if (agent === '' && input.agent !== undefined) throw new Error('schedule create: пустое имя профиля агента')
+    const effort = input.effort === undefined ? null : checkEffort(input.effort, 'create')
     if (input.watch === undefined && deliver === 'raw' && check === '') {
       throw new Error('schedule create: режим raw требует check — без команды проверки отправлять нечего')
     }
@@ -613,6 +709,7 @@ export function createScheduleRegistry(
         lastSkipAt: null,
         paused: false,
         agent: agent === '' ? null : agent,
+        effort,
         generation: 0,
       }
       insert.run(
@@ -629,6 +726,7 @@ export function createScheduleRegistry(
         record.check,
         record.deliver,
         record.agent,
+        record.effort,
         watch.command,
         watch.pattern,
         watch.windowSec,
@@ -667,6 +765,7 @@ export function createScheduleRegistry(
       lastSkipAt: null,
       paused: false,
       agent: agent === '' ? null : agent,
+      effort,
       generation: 0,
     }
     insert.run(
@@ -683,6 +782,7 @@ export function createScheduleRegistry(
       record.check,
       record.deliver,
       record.agent,
+      record.effort,
       null,
       null,
       null,
@@ -722,6 +822,9 @@ export function createScheduleRegistry(
     if (spec === '') throw new Error('schedule update: пустое расписание')
     const task = input.task === undefined ? record.task : typeof input.task === 'string' ? input.task.trim() : ''
     if (task === '') throw new Error('schedule update: пустой текст задания')
+    // Checked before any write, so a wrong level leaves the job as it was.
+    const effort =
+      input.effort === undefined ? record.effort : input.effort === '' ? null : checkEffort(input.effort, 'update')
 
     // A watcher keeps its own fields; a change bumps the generation so the
     // supervisor stops the old process and starts the command again.
@@ -735,7 +838,7 @@ export function createScheduleRegistry(
       }
       if (input.deliver !== undefined) merged.deliver = input.deliver
       const watch = validateWatch(merged, 'update')
-      updateWatchRow.run(spec, task, watch.command, watch.pattern, watch.windowSec, watch.deliver, id)
+      updateWatchRow.run(spec, task, watch.command, watch.pattern, watch.windowSec, watch.deliver, effort, id)
       return get(id) ?? record
     }
 
@@ -785,6 +888,7 @@ export function createScheduleRegistry(
       check,
       deliver,
       agent,
+      effort,
       next.getTime(),
       id,
     )
@@ -796,8 +900,40 @@ export function createScheduleRegistry(
     const duration = Number.isFinite(input.durationMs) ? Math.max(0, Math.round(input.durationMs)) : 0
     const status: ScheduleRunStatus = input.status === 'error' ? 'error' : input.status === 'skip' ? 'skip' : 'ok'
     insertRun.run(input.jobId, input.startedAt.getTime(), duration, status, runOutput(input.output))
-    if (status === 'skip') trimSkips.run(input.jobId, input.jobId)
-    else trimRuns.run(input.jobId, input.jobId)
+    if (status === 'skip') {
+      trimSkips.run(input.jobId, input.jobId)
+      return
+    }
+    trimRuns.run(input.jobId, input.jobId)
+    const kind: ScheduleRunKind =
+      status === 'error' ? 'error' : input.output.trim() === '' ? 'empty' : isSilent(input.output) ? 'silent' : 'text'
+    insertTally.run(input.jobId, input.startedAt.getTime(), kind, kind === 'error' ? runOutput(input.output) : '')
+    trimTally.run(now().getTime() - SCHEDULE_SUMMARY_DAYS * DAY_MS)
+  }
+
+  function summary(): ScheduleSummary[] {
+    const since = now().getTime() - SCHEDULE_SUMMARY_DAYS * DAY_MS
+    const counts = new Map<string, Partial<Record<ScheduleRunKind, number>>>()
+    for (const row of selectTally.all(since) as unknown as { job_id: string; kind: ScheduleRunKind; n: number }[]) {
+      counts.set(row.job_id, { ...counts.get(row.job_id), [row.kind]: row.n })
+    }
+    // Ordered oldest first, so the last row of a job is its latest failure.
+    const lastErrors = new Map<string, string>()
+    for (const row of selectLastError.all(since) as unknown as { job_id: string; error: string }[]) {
+      lastErrors.set(row.job_id, row.error)
+    }
+    return list().map((record) => {
+      const own = counts.get(record.id) ?? {}
+      return {
+        id: record.id,
+        task: record.task,
+        text: own.text ?? 0,
+        silent: own.silent ?? 0,
+        empty: own.empty ?? 0,
+        error: own.error ?? 0,
+        lastError: lastErrors.get(record.id) ?? null,
+      }
+    })
   }
 
   function history(id: string): ScheduleRun[] {
@@ -809,6 +945,15 @@ export function createScheduleRegistry(
     ]
     rows.sort((left, right) => right.id - left.id)
     return rows.map(toRun)
+  }
+
+  function failureStreak(id: string): number {
+    let streak = 0
+    for (const row of selectRealRuns.all(id) as unknown as ScheduleRunRow[]) {
+      if (row.status !== 'error') break
+      streak += 1
+    }
+    return streak
   }
 
   function due(at: Date): ScheduleRecord[] {
@@ -887,5 +1032,7 @@ export function createScheduleRegistry(
     resume,
     recordRun,
     history,
+    summary,
+    failureStreak,
   }
 }

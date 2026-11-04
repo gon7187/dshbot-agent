@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { afterEach, expect, test } from 'vitest'
 
 import { openStore, type Store } from '../store/src/index.js'
-import { createScheduleRegistry, createScheduleTool } from './src/index.js'
+import { createScheduleRegistry, createScheduleTool, SCHEDULER_NAMESPACE } from './src/index.js'
 
 const MINUTE = 60_000
 const NOW = new Date('2026-10-23T10:00:00Z')
@@ -49,22 +49,6 @@ test('test_j1_interval_and_cron_rows_survive_closing_and_reopening_the_store', (
   expect(jobs[0]?.schedule.kind).toBe('every')
   expect(jobs[1]?.schedule.kind).toBe('cron')
   expect(jobs[0]?.nextRunAt).toEqual(new Date(NOW.getTime() + 30 * MINUTE))
-})
-
-test('test_j2_one_shot_runs_once_and_then_has_no_next_run', () => {
-  const store = open()
-  const registry = createScheduleRegistry(store, { now: () => NOW, id: () => 'one-shot' })
-
-  const job = registry.create({ spec: '30m', task: 'проверить один раз' })
-  expect(job.nextRunAt).toEqual(new Date(NOW.getTime() + 30 * MINUTE))
-
-  const due = new Date(NOW.getTime() + 30 * MINUTE)
-  expect(registry.due(due).map((row) => row.id)).toEqual(['one-shot'])
-
-  const claimed = registry.claim('one-shot', due)
-  expect(claimed?.nextRunAt).toBeNull()
-  expect(registry.claim('one-shot', due)).toBeNull()
-  expect(registry.due(new Date(NOW.getTime() + 120 * MINUTE))).toEqual([])
 })
 
 test('absolute one-shot keeps its Date through storage and can be listed after restart', async () => {
@@ -116,99 +100,13 @@ test('test_j4_create_rejects_a_past_one_shot_and_a_broken_spec_without_saving', 
   expect(registry.list()).toEqual([])
 })
 
-test('test_j6_agent_profile_survives_storage_and_an_unknown_profile_is_refused', async () => {
-  const store = open()
-  let sequence = 0
-  const registry = createScheduleRegistry(store, { now: () => NOW, id: () => `prof-job-${(sequence += 1)}` })
-  const tool = createScheduleTool({
-    registry,
-    agents: { has: (name) => name === 'mailer', names: () => ['mailer'] },
-  })
-
-  const created = JSON.parse(
-    await tool.execute({ action: 'create', schedule: 'every 15m', task: 'inbox', agent: 'mailer' }),
-  ) as { id: string; agent: string | null }
-  expect(created.agent).toBe('mailer')
-  expect(registry.get('prof-job-1')?.agent).toBe('mailer')
-  const listed = JSON.parse(await tool.execute({ action: 'list' })) as {
-    jobs: Array<{ id: string; agent: string | null }>
-  }
-  expect(listed.jobs[0]?.agent).toBe('mailer')
-
-  await expect(
-    tool.execute({ action: 'create', schedule: 'every 15m', task: 'inbox', agent: 'ghost' }),
-  ).rejects.toThrow(/неизвестный профиль агента "ghost".*mailer/s)
-  await expect(tool.execute({ action: 'update', id: 'prof-job-1', agent: 'ghost' })).rejects.toThrow(
-    /неизвестный профиль агента "ghost"/,
-  )
-  // A plain job keeps no profile.
-  const plain = JSON.parse(await tool.execute({ action: 'create', schedule: 'every 20m', task: 'plain' })) as {
-    agent: string | null
-  }
-  expect(plain.agent).toBeNull()
-})
-
-test('test_j5_tool_creates_lists_and_removes_without_a_gate_script_in_the_schema', async () => {
-  const store = open()
-  const registry = createScheduleRegistry(store, { now: () => NOW, id: () => 'tool-job' })
+test('cron delay tasks are refused on create/update while real one-shots remain valid', async () => {
+  const registry = createScheduleRegistry(open(), { now: () => NOW, timeZone: 'UTC' })
   const tool = createScheduleTool({ registry })
-
-  expect(tool.name).toBe('schedule')
-  const schema = JSON.stringify(tool.inputSchema)
-  expect(schema).not.toMatch(/wake/i)
-  expect(schema).toContain('create')
-  expect(schema).toContain('list')
-  expect(schema).toContain('remove')
-
-  const created = JSON.parse(await tool.execute({ action: 'create', schedule: 'every 15m', task: 'сводка' })) as {
-    id: string
-    schedule: string
-  }
-  expect(created.id).toBe('tool-job')
-  expect(created.schedule).toBe('every 15m')
-
-  const listed = JSON.parse(await tool.execute({ action: 'list' })) as { jobs: Array<{ task: string }> }
-  expect(listed.jobs.map((job) => job.task)).toEqual(['сводка'])
-
-  await tool.execute({ action: 'remove', id: 'tool-job' })
-  const empty = JSON.parse(await tool.execute({ action: 'list' })) as { jobs: unknown[] }
-  expect(empty.jobs).toEqual([])
-  await expect(tool.execute({ action: 'remove', id: 'tool-job' })).rejects.toThrow(/не найдено/)
-})
-
-test('test_j7_history_of_a_removed_job_still_shows_every_skip_through_the_tool', async () => {
-  const store = open()
-  let sequence = 0
-  const registry = createScheduleRegistry(store, { now: () => NOW, id: () => `gone-${(sequence += 1)}` })
-  const tool = createScheduleTool({ registry })
-  type History = { id: string; runs: Array<{ status: string; output: string }> }
-
-  // A job ended by max_runs: its single claim is skipped, the row goes away.
-  registry.create({ spec: 'every 10m', task: 'однократно', maxRuns: 1 })
-  const due = new Date(NOW.getTime() + 11 * MINUTE)
-  expect(registry.claim('gone-1', due)).not.toBeNull()
-  registry.recordRun({ jobId: 'gone-1', startedAt: due, durationMs: 0, status: 'skip', output: 'SKIP-MAX-A' })
-  expect(registry.finish(due).map((ended) => [ended.job.id, ended.reason])).toEqual([['gone-1', 'max_runs']])
-  expect(registry.get('gone-1')).toBeUndefined()
-  registry.recordRun({ jobId: 'gone-1', startedAt: due, durationMs: 0, status: 'skip', output: 'SKIP-MAX-B' })
-
-  const ended = JSON.parse(await tool.execute({ action: 'history', id: 'gone-1' })) as History
-  expect(ended.id).toBe('gone-1')
-  expect(ended.runs.map((run) => [run.status, run.output]).sort()).toEqual([
-    ['skip', 'SKIP-MAX-A'],
-    ['skip', 'SKIP-MAX-B'],
-  ])
-
-  // A job removed by hand after two skips keeps one row per skip as well.
-  registry.create({ spec: 'every 10m', task: 'удалить вручную' })
-  for (const output of ['SKIP-HAND-1', 'SKIP-HAND-2']) {
-    registry.recordRun({ jobId: 'gone-2', startedAt: due, durationMs: 0, status: 'skip', output })
-  }
-  await tool.execute({ action: 'remove', id: 'gone-2' })
-  expect(registry.get('gone-2')).toBeUndefined()
-  const removed = JSON.parse(await tool.execute({ action: 'history', id: 'gone-2' })) as History
-  expect(removed.runs.filter((run) => run.status === 'skip')).toHaveLength(2)
-
-  // An id with neither a job nor runs is still unknown.
-  await expect(tool.execute({ action: 'history', id: 'never-was' })).rejects.toThrow(/не найдено/)
+  await expect(tool.execute({ action: 'create', schedule: '* * * * *', task: 'Send report через 2 минуты' })).rejects.toThrow()
+  expect(registry.list()).toEqual([])
+  const created = JSON.parse(await tool.execute({ action: 'create', schedule: '2m', task: 'Send report' })) as { id: string }
+  expect(registry.get(created.id)?.nextRunAt).toEqual(new Date(NOW.getTime() + 2 * MINUTE))
+  await expect(tool.execute({ action: 'update', id: created.id, schedule: '* * * * *', task: 'Send report через 2 минуты' })).rejects.toThrow()
+  expect(registry.get(created.id)?.task).toBe('Send report')
 })

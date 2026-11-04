@@ -20,13 +20,13 @@ DSHBOT runs an autonomous model with tools on the owner's machine. The most impo
 - **The owner is not the model.** The model's instructions and external content are untrusted. Two layers check tool calls, depending on the tool:
   - **Shell tools** (`exec`, `host_exec`) pass a deterministic command guard (`deny`, `confirm`, `allow`) and then run as described under the sandbox item below.
   - **Other tools** (files, web, memory, MCP and the rest) run inside the daemon process without the command guard. They are bounded by the general access policy — for example, file tools only see the allowed roots and keep secret paths hidden — and by owner confirmations where an action requires one.
-- **Owner actions need the owner.** Dangerous, irreversible or out-of-workspace actions require an explicit Telegram confirmation card. Free-form "yes" text does not authorize anything.
+- **Owner actions need the owner.** Dangerous, irreversible or out-of-workspace actions require an explicit Telegram confirmation card. Every local `host_exec` command requires owner consent, including read-only commands: a card or a previously granted permission for that exact host alias and command; SSH retains its existing guard and approval policy. Free-form "yes" text does not authorize anything.
 - **External content is data.** Web pages, mail, MCP results, command output, files, office documents and attachments reach the model inside an `EXTERNAL_UNTRUSTED_CONTENT` frame, and the prompt forbids following instructions from that frame.
 - **Secrets stay out of tools.** Child processes receive a cleaned environment without the bot token, the DeepSeek key or stored secrets. Secret values are masked in output, journals and exported history.
 - **Guests are separate.** A guest has no owner memory, files, schedules, credentials or owner tools, and a guest `exec` runs in a fresh, empty bubblewrap sandbox.
 - **Sandboxes depend on where a command runs.**
   - `exec` runs in bubblewrap without the owner's `HOME`: it sees the workspace and the extra roots the owner configured, with their read-only or read-write mode, and secret paths inside them are masked.
-  - A local `host_exec` runs in bubblewrap over a read-only machine: the owner's `HOME` is readable, and writes go only to `DSHBOT_HOME`, `/tmp` and directories listed in `DSHBOT_HOST_WRITABLE`.
+  - A local `host_exec` requires owner consent before execution (a card or an exact stored grant), then runs in bubblewrap over a read-only machine: the owner's `HOME` is readable, and writes go only to `DSHBOT_HOME`, `/tmp` and directories listed in `DSHBOT_HOST_WRITABLE`.
   - An SSH `host_exec` runs on the owner's remote host through SSH without a sandbox; the command guard and the confirmation cards are its only checks.
   - If bubblewrap is unavailable, a local command is refused instead of running unprotected.
 - **Panic is final.** `/panic` stops turns, subagents, wake-ups and evolution and exits with code 77; systemd does not restart the daemon after a panic.

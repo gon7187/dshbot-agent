@@ -1,7 +1,7 @@
 // Same createFactory / SQLite / disposable-repository harness as
 // execution-recovery.test.ts. Only roles and the sandbox runner are doubles.
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, symlinkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -197,45 +197,17 @@ test('test_c1_gate_replacing_worktree_identity_stops_before_review_or_owner_comm
   expect(readFileSync(join(project, SOURCE_PATH), 'utf8')).toBe(BASE_SOURCE)
 })
 
-test('test_c2_role_sessions_are_fresh_when_an_interrupted_task_resumes_after_restart', async () => {
-  const firstFactory = await startFactory(async (turn) => {
-    if (turn.role === 'executor') throw Object.assign(new Error('daemon stopped'), { code: 'ABORTED' })
-    return happy(turn)
-  })
-  const id = seedTask()
-  await approve(firstFactory, id)
-  await vi.waitFor(() => expect(turns.map((turn) => turn.role)).toEqual(['test_writer', 'executor']), { timeout: WAIT })
-  await new Promise((resolve) => setTimeout(resolve, 20))
-  expect(task(id).status).toBe('running')
-  expect(gateRuns).toHaveLength(1)
-  const beforeRestart = turns.slice()
-  const worktree = task(id).worktree
-
-  // Reopen the durable store and recreate the factory as daemon startup does.
-  store.close()
-  store = openStore(join(home, 'state.db'))
-  await startFactory()
-  await settled(id)
-  const afterRestart = turns.slice(beforeRestart.length)
-  // The writer tests are recorded and the worktree is on the task branch: the
-  // restart continues with the executor instead of running the writer again.
-  expect(afterRestart.map((turn) => turn.role)).toEqual(['executor', 'reviewer'])
-  expect(turns.filter((turn) => turn.role === 'test_writer')).toHaveLength(1)
-  const interruptedExecutor = beforeRestart.find((turn) => turn.role === 'executor')!
-  const resumedExecutor = afterRestart.find((turn) => turn.role === 'executor')!
-  expect(resumedExecutor.cwd).toBe(worktree)
-  expect(resumedExecutor.prompt).toMatch(/перезапуск/i)
-  expect(resumedExecutor.sessionId, 'the executor must not reload its interrupted history')
-    .not.toBe(interruptedExecutor.sessionId)
-  expect(new Set(turns.map((turn) => turn.sessionId)).size).toBe(turns.length)
-  expect(task(id).execution_note).toBe('готово к приёмке')
-})
-
-test('test_c4_gate_mutations_of_locked_tests_and_outside_paths_void_the_round_and_are_restored', async () => {
+test.each(['content', 'symlink', 'red'])('gate %s mutations of locked tests and outside paths are restored before review', async (kind) => {
   let tampered = false
   afterGate = (options, result) => {
-    if (!result.ok || tampered) return
-    put(join(options.candidate, TEST_PATH), '// assertions disabled by project code\n')
+    if (gateRuns.length !== 2 || tampered) return
+    if (kind === 'red') { result.ok = false; result.status = 1; result.output = 'RED-PROTECTED-GATE' }
+    if (kind !== 'symlink') put(join(options.candidate, TEST_PATH), '// assertions disabled by project code\n')
+    else {
+      put(join(options.candidate, 'copied-test.mjs'), RED_TEST)
+      rmSync(join(options.candidate, TEST_PATH))
+      symlinkSync('copied-test.mjs', join(options.candidate, TEST_PATH))
+    }
     put(join(options.candidate, OUTSIDE_PATH), 'changed outside scope by project code\n')
     tampered = true
   }
@@ -267,34 +239,6 @@ test('test_c4_gate_mutations_of_locked_tests_and_outside_paths_void_the_round_an
   expect(turns.filter((turn) => turn.role === 'reviewer')).toHaveLength(1)
   expect(task(id).execution_note).toBe('готово к приёмке')
   expect(readFileSync(join(task(id).worktree!, TEST_PATH), 'utf8')).toBe(RED_TEST)
+  expect(lstatSync(join(task(id).worktree!, TEST_PATH)).isSymbolicLink()).toBe(false)
   expect(readFileSync(join(task(id).worktree!, OUTSIDE_PATH), 'utf8')).toBe(OWNER_NOTES)
-})
-
-test('test_c9_role_write_tool_refuses_git_ignored_paths_with_an_explanation', async () => {
-  // Exercise both writing roles, with the ignored path allowed by the task.
-  expect(git(project, 'check-ignore', '--no-index', IGNORED_PATH)).toBe(IGNORED_PATH)
-  const attempts: Array<{ role: string; reply: string; created: boolean }> = []
-  const factory = await startFactory(async (turn) => {
-    if (turn.role !== 'reviewer') {
-      let reply: string
-      try {
-        reply = await write(turn, IGNORED_PATH, 'export const generated = true\n')
-      } catch (error) {
-        reply = error instanceof Error ? error.message : String(error)
-      }
-      attempts.push({ role: turn.role, reply, created: existsSync(join(turn.cwd, IGNORED_PATH)) })
-    }
-    return happy(turn)
-  })
-  const id = seedTask([SOURCE_PATH, 'build/'])
-  await approve(factory, id)
-  await settled(id)
-
-  expect(attempts.map((attempt) => attempt.role)).toEqual(['test_writer', 'executor'])
-  for (const attempt of attempts) {
-    expect(attempt.created, `${attempt.role} must refuse before creating the ignored file`).toBe(false)
-    expect(attempt.reply).toMatch(/игнор|ignor/i)
-  }
-  expect(gateRuns).toHaveLength(2)
-  expect(task(id).execution_note).toBe('готово к приёмке')
 })

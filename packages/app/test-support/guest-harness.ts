@@ -4,7 +4,7 @@
 // (Date) by an offset read from a file, so the 24 hour expiry and the UTC day can be tested.
 
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -17,8 +17,8 @@ export { GUEST_CHARTER, GUEST_IDENTITY }
 
 export const repoRoot = fileURLToPath(new URL('../../..', import.meta.url))
 
-export const TEST_TIMEOUT_MS = 170_000
-export const WAIT_MS = 45_000
+export const TEST_TIMEOUT_MS = 45_000
+export const WAIT_MS = 15_000
 export const LONG_POLL_HOLD_MS = 20_000
 export const QUIET_MS = 1_800
 /** A little over the real-time guest pace limit. */
@@ -95,7 +95,7 @@ export function sse(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 }
 
-export function pongStream(): string {
+export function pongStream(text = 'pong'): string {
   return [
     sse('message_start', {
       type: 'message_start',
@@ -112,7 +112,7 @@ export function pongStream(): string {
     }),
     sse('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
     sse('ping', { type: 'ping' }),
-    sse('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'pong' } }),
+    sse('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }),
     sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
     sse('message_delta', {
       type: 'message_delta',
@@ -139,6 +139,7 @@ export function pongMessage(): string {
 export interface Stub {
   server: Server
   origin: string
+  respond?: (body: JsonObject, response: ServerResponse) => boolean
   /**
    * Paid-call-then-cancel scenario: the first `COSTCANCEL-first` call answers
    * with an owner tool_use and an expensive usage, the follow-up call with its
@@ -206,6 +207,7 @@ export async function startStub(timeline: Timeline): Promise<Stub> {
         timeline.events.push({ n: timeline.seq, src: 'ds', body })
       }
       timeline.lastActivityAt = Date.now()
+      if (isModelCall && stub.respond?.(body, res)) return
       if (body.stream === false) {
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(pongMessage())
@@ -585,7 +587,17 @@ export function spawnDaemon(extraEnv: Record<string, string> = {}): Daemon {
   }
   if (process.env.TMPDIR) env.TMPDIR = process.env.TMPDIR
   // `exec` makes the node process the direct child, so signals and exit codes are the daemon's own.
-  const child = spawn('sh', ['-c', `exec ${startScript()}`], { cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'] })
+  const container = env.DSHBOT_ISOLATION === 'container'
+  if (container) {
+    env.NODE_OPTIONS = ''
+    env.NODE_ENV = 'production'
+    env.XDG_RUNTIME_DIR = world.dshbotHome
+    env.NODE_COMPILE_CACHE = join(world.dshbotHome, 'compile-cache')
+    env.DSHBOT_CONTAINER_RO = dirname(realpathSync(join(repoRoot, 'node_modules', '.bin')))
+  }
+  const child = container
+    ? spawn('bash', [join(repoRoot, 'scripts/dshbot-run.sh'), process.execPath, ...startScript().split(/\s+/).slice(1)], { cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    : spawn('sh', ['-c', `exec ${startScript()}`], { cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'] })
   const daemon: Daemon = {
     child,
     stdout: '',

@@ -3,3 +3,6 @@
 /refs/*.log
 graphify-out/
 node_modules/
+
+# Временные каталоги packages/app/guest-owner-isolation.test.ts: остаются при оборванном прогоне
+/.guest-isolation-*/

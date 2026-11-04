@@ -96,16 +96,54 @@ export const SESSION_INDEX_STEPS: readonly string[] = [
   )`,
 ]
 
-/** Plain word tokens; FTS5 syntax from the model can never reach MATCH. */
-function words(query: string): string[] {
-  const tokens = query.match(/[\p{L}\p{N}_]+/gu) ?? []
-  return [...new Set(tokens.map((token) => token.toLowerCase()))]
+/** Words up to this long are searched only as written; longer ones also match other forms. */
+const WHOLE_WORD_MAX = 4
+const STEM_MIN = 4
+const CYRILLIC_ENDING =
+  /(?:ами|ями|ого|его|ому|ему|ыми|ими|ов|ев|ей|ом|ем|ам|ям|ах|ях|ых|их|ым|им|ую|юю|ой|ий|ый|ая|яя|ое|ее|[аяуюеоыиьй])$/u
+const LATIN_ENDING = /(?:ing|ed|es|s)$/u
+
+export interface QueryTerm {
+  /** The word as written, lowercased. */
+  word: string
+  /** Shared beginning of the word's other forms; null for words searched only whole. */
+  stem: string | null
 }
 
-function toMatchQuery(query: string): string | null {
-  const tokens = words(query).slice(0, 64)
-  if (tokens.length === 0) return null
-  return tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(' OR ')
+function stemOf(word: string): string | null {
+  if ([...word].length <= WHOLE_WORD_MAX) return null
+  const ending = /^\p{Script=Cyrillic}+$/u.test(word)
+    ? CYRILLIC_ENDING
+    : /^\p{Script=Latin}+$/u.test(word)
+      ? LATIN_ENDING
+      : null
+  if (ending === null) return null
+  const stripped = word.replace(ending, '')
+  return [...stripped].length >= STEM_MIN ? stripped : word
+}
+
+/**
+ * Distinct plain word tokens of a query with the stem of each long one. FTS5
+ * syntax from the model never survives: only letters, digits and `_` do.
+ */
+export function queryTerms(query: string): QueryTerm[] {
+  const tokens = query.match(/[\p{L}\p{N}_]+/gu) ?? []
+  return [...new Set(tokens.map((token) => token.toLowerCase()))]
+    .slice(0, 64)
+    .map((word) => ({ word, stem: stemOf(word) }))
+}
+
+/**
+ * FTS5 query made only of quoted terms. A long word is searched as written
+ * and as a prefix of its stem; the exact phrase adds to the bm25 score, so the
+ * exact form ranks above the other forms.
+ */
+export function toMatchQuery(terms: readonly QueryTerm[]): string | null {
+  if (terms.length === 0) return null
+  const quote = (value: string): string => `"${value.replaceAll('"', '""')}"`
+  return terms
+    .map(({ word, stem }) => (stem === null ? quote(word) : `${quote(word)} OR ${quote(stem)}*`))
+    .join(' OR ')
 }
 
 function nonNegativeSafeInteger(value: unknown, field: string): number {
@@ -205,7 +243,7 @@ export function createSessionIndex(db: DatabaseSync): SessionIndex {
       }
     },
     search(query, options = {}) {
-      const match = toMatchQuery(query)
+      const match = toMatchQuery(queryTerms(query))
       if (match === null) return []
       const since = options.since ?? 0
       const until = options.until ?? Number.MAX_SAFE_INTEGER

@@ -16,6 +16,7 @@ function formatterFor(timeZone: string): Intl.DateTimeFormat {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+    second: '2-digit',
     hourCycle: 'h23',
   })
   formatters.set(timeZone, formatter)
@@ -46,4 +47,11 @@ export function localDate(instantMs: number, timeZone = 'UTC'): string {
 export function localTime(instantMs: number, timeZone = 'UTC'): string {
   const values = partsOf(instantMs, timeZone)
   return `${read(values, 'hour', timeZone)}:${read(values, 'minute', timeZone)}`
+}
+
+/** `YYYY-MM-DD HH:MM:SS` of the instant in `timeZone` (UTC when the zone is absent). */
+export function localDateTime(instantMs: number, timeZone = 'UTC'): string {
+  const values = partsOf(instantMs, timeZone)
+  const clock = ['hour', 'minute', 'second'].map((type) => read(values, type, timeZone)).join(':')
+  return `${localDate(instantMs, timeZone)} ${clock}`
 }

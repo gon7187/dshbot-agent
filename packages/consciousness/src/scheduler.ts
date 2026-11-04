@@ -11,6 +11,13 @@
 // 60 min with the default 0.3 rings between 42 and 78 min. `intervalMinutes()`
 // keeps reporting the base, so the prompt and the model stay about the rhythm,
 // not about one random draw. The owner bounds 15..240 min apply to the draw too.
+//
+// The deadline and the base interval survive a restart of the daemon: with a
+// `storage` the scheduler writes `{dueAt, intervalMinutes}` whenever it arms the
+// alarm and continues the count after `start()`. A deadline missed during the
+// downtime (up to 4 hours) rings once, shortly after the start; an older one is
+// dropped and the next alarm counts from the start. A missing or unreadable
+// record starts the scheduler as a fresh one.
 
 import { MINUTE_MS } from '../../scheduler/src/index.js'
 
@@ -26,6 +33,42 @@ export const DEFAULT_WAKE_JITTER = 0.3
 
 /** A machine that slept for longer than this does not get a stale wake-up burst. */
 const MAX_STALE_WAKE_MS = 4 * 60 * MINUTE_MS
+
+/** A deadline missed during a restart rings this long after the start, once. */
+const CATCH_UP_DELAY_MS = 2 * MINUTE_MS
+
+/** Where the scheduler keeps its deadline and interval between processes. */
+export interface WakeScheduleStorage {
+  /** The stored text, or undefined when nothing is stored. */
+  read: () => string | undefined
+  write: (value: string) => void
+}
+
+/** The persisted state: the planned moment of the next alarm and the base interval. */
+interface StoredWakeSchedule {
+  dueAt: number
+  intervalMinutes: number
+}
+
+/**
+ * Parse a stored record; undefined when the deadline is not a finite moment or the
+ * interval is not inside the owner bounds. Such a record is damaged: it is never
+ * silently repaired into some other interval.
+ */
+function parseStoredSchedule(text: string): StoredWakeSchedule | undefined {
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+  if (typeof value !== 'object' || value === null) return undefined
+  const { dueAt, intervalMinutes } = value as Record<string, unknown>
+  if (typeof dueAt !== 'number' || !Number.isFinite(dueAt) || dueAt < 0) return undefined
+  if (typeof intervalMinutes !== 'number' || !Number.isFinite(intervalMinutes)) return undefined
+  if (intervalMinutes < MIN_WAKE_INTERVAL_MIN || intervalMinutes > MAX_WAKE_INTERVAL_MIN) return undefined
+  return { dueAt, intervalMinutes }
+}
 
 /** How one wake-up turn ended. */
 export type WakeTurnOutcome = 'ok' | 'failed'
@@ -48,6 +91,8 @@ export interface WakeSchedulerOptions {
   jitter?: number
   /** Random seam for the jitter; defaults to `Math.random`. */
   random?: () => number
+  /** Keeps the deadline and the interval across restarts; without it the alarm lives in memory only. */
+  storage?: WakeScheduleStorage
   /** Reported once per failed turn; a broken handler never breaks the alarm. */
   onError?: (error: unknown) => void
 }
@@ -112,7 +157,33 @@ export function createWakeScheduler(options: WakeSchedulerOptions): WakeSchedule
   let running = false
   let requestedDuringTurn: number | undefined
   let dueAt: number | undefined
+  /** The deadline last written to the storage; it outlives `dueAt` while a turn runs. */
+  let savedDueAt: number | undefined
   let handle: unknown
+
+  function persist(): void {
+    if (options.storage === undefined || savedDueAt === undefined) return
+    try {
+      options.storage.write(JSON.stringify({ dueAt: savedDueAt, intervalMinutes: interval }))
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
+  /** The stored state of a previous process, or undefined for a fresh start. */
+  function restore(): StoredWakeSchedule | undefined {
+    let text: string | undefined
+    try {
+      text = options.storage?.read()
+    } catch (error) {
+      reportError(error)
+      return undefined
+    }
+    if (text === undefined) return undefined
+    const stored = parseStoredSchedule(text)
+    if (stored === undefined) reportError(new Error('stored wake-up schedule is unreadable, starting with the default interval'))
+    return stored
+  }
 
   /** The actual alarm interval: the base with the configured spread, still inside the owner bounds. */
   function drawnInterval(minutes: number): number {
@@ -130,12 +201,33 @@ export function createWakeScheduler(options: WakeSchedulerOptions): WakeSchedule
     dueAt = undefined
   }
 
-  function arm(minutes: number): void {
+  function armAfter(delay: number): void {
     if (!started || stopped || running) return
     clear()
-    const delay = drawnInterval(minutes) * MINUTE_MS
     dueAt = now() + delay
+    savedDueAt = dueAt
     handle = setTimer(onTimer, delay)
+    persist()
+  }
+
+  function arm(minutes: number): void {
+    armAfter(drawnInterval(minutes) * MINUTE_MS)
+  }
+
+  /** Continue the count of a previous process; false when the record is of no use. */
+  function resume(stored: StoredWakeSchedule): boolean {
+    // The chosen interval stays in force even when the deadline itself is dropped.
+    interval = clampInterval(stored.intervalMinutes)
+    const late = now() - stored.dueAt
+    if (late > MAX_STALE_WAKE_MS) return false
+    if (late >= 0) {
+      armAfter(CATCH_UP_DELAY_MS)
+      return true
+    }
+    // A deadline farther away than any interval can draw is a clock that moved back.
+    if (-late > MAX_WAKE_INTERVAL_MIN * MINUTE_MS) return false
+    armAfter(-late)
+    return true
   }
 
   function onTimer(): void {
@@ -187,6 +279,8 @@ export function createWakeScheduler(options: WakeSchedulerOptions): WakeSchedule
     start() {
       if (started || stopped) return
       started = true
+      const stored = restore()
+      if (stored !== undefined && resume(stored)) return
       arm(interval)
     },
     stop() {
@@ -197,7 +291,10 @@ export function createWakeScheduler(options: WakeSchedulerOptions): WakeSchedule
     setNextInterval(minutes: number): number {
       interval = clampInterval(minutes)
       if (!running) arm(interval)
-      else requestedDuringTurn = interval
+      else {
+        requestedDuringTurn = interval
+        persist()
+      }
       return interval
     },
     intervalMinutes: () => interval,

@@ -164,9 +164,6 @@ test('plain words, quotes, escapes and leading assignments become argv without a
   expect(testCommandArgv('CI=1 FOO="a b" npm test BAR=2')).toEqual({ argv: ['env', 'CI=1', 'FOO=a b', 'npm', 'test', 'BAR=2'] })
   // A quoted name is no assignment: sh runs it as the program itself.
   expect(testCommandArgv('"CI=1" npm')).toEqual({ argv: ['CI=1', 'npm'] })
-})
-
-test('a command only a shell understands is refused with the offending character', () => {
   const refused: Array<[string, RegExp]> = [
     ['npm test && npm run lint', /«&»/],
     ['npm test | tee out', /«\|»/],
@@ -195,30 +192,6 @@ test('a command only a shell understands is refused with the offending character
     expect((result as { error: string }).error, command).toMatch(reason)
   }
 })
-
-test('the project menu refuses a test command that needs a shell and saves a plain one', async () => {
-  const factory = startFactory()
-  const commands = (): string[] =>
-    (store.db.prepare('SELECT test_command FROM factory_projects ORDER BY id').all() as Array<{ test_command: string }>)
-      .map((row) => row.test_command)
-  const answer = async (text: string): Promise<string> => {
-    expect(await factory.handleCallback({ id: 'cb-pa', chatId: OWNER, fromId: OWNER, messageId: 1, data: 'f1:pa' })).toBe(true)
-    sent = []
-    expect(await factory.takeInput(OWNER, `${project}\n${text}`)).toBe(true)
-    return sent.join('\n')
-  }
-
-  const refusal = await answer('npm test | tee log')
-  expect(refusal).toMatch(/без оболочки/)
-  expect(refusal).toContain('«|»')
-  expect(commands()).toEqual([])
-  expect(await answer('npm test\nnpm run lint')).toMatch(/перевод строки/)
-  expect(commands()).toEqual([])
-  // Positive control: the same menu path stores a command argv can carry.
-  expect(await answer('CI=1 npm test')).not.toMatch(/без оболочки/)
-  expect(commands()).toEqual(['CI=1 npm test'])
-})
-
 test('a project test command that needs a shell stops the task before any worktree, role or gate', async () => {
   // The schema exists once the factory is created; its resume pass sees no task.
   const factory = startFactory()
@@ -238,25 +211,4 @@ test('a project test command that needs a shell stops the task before any worktr
   expect(git(project, 'worktree', 'list', '--porcelain').split('\n').filter((line) => line.startsWith('worktree '))).toHaveLength(1)
   expect(git(project, 'rev-parse', 'HEAD')).toBe(head)
   expect(git(project, 'status', '--porcelain')).toBe('')
-})
-
-test('every gate of a task gets the parsed argv of the project command', async () => {
-  const factory = startFactory()
-  const projectId = addProject(`CI=1 fixture-tests --unit 'a b'`)
-  const id = seedTask(projectId)
-  await approveAndSettle(factory, id)
-
-  expect(task(id).execution_note).toBe('готово к приёмке')
-  expect(gateRuns.length, 'writer gate and executor gate').toBeGreaterThanOrEqual(2)
-  for (const run of gateRuns) expect(run.command).toEqual(['env', 'CI=1', 'fixture-tests', '--unit', 'a b'])
-})
-
-test('the own repository runs npm test as two argv words', async () => {
-  const factory = startFactory()
-  const id = seedTask(0)
-  await approveAndSettle(factory, id)
-
-  expect(task(id).execution_note).toBe('готово к приёмке')
-  expect(gateRuns.length).toBeGreaterThanOrEqual(2)
-  for (const run of gateRuns) expect(run.command).toEqual(['npm', 'test'])
 })

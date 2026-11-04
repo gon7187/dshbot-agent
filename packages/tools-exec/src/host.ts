@@ -20,7 +20,7 @@
 // start, the command is not run at all: there is no unprotected run.
 //
 // The command passes the same guard as `exec` (`checkCommand`): a denied
-// command never starts a process, and a confirmation-class command runs only
+// command never starts a process, and every local command (or confirmation-class SSH command) runs only
 // after the owner pressed the allow button of the card (`approval`). Output is
 // bounded, cut with a visible mark, and the values of the bot's own secrets are
 // replaced before the model sees anything.
@@ -449,7 +449,7 @@ export type HostTarget =
 export interface HostExecOptions {
   /** `DSHBOT_HOME`; its `hosts.json` names the targets. */
   home: string
-  /** Owner approval for confirmation-class commands; absent means every one is refused. */
+  /** Owner approval for every local command and confirmation-class SSH commands; absent means refusal. */
   approval?: ExecApproval
   /** Default foreground timeout in milliseconds. */
   timeoutMs?: number
@@ -675,19 +675,19 @@ function runProcess(
   })
 }
 
-/** Ask the guard and, for a confirmation-class command, the owner. */
-async function admit(command: string, host: string, approval: ExecApproval | undefined, purpose?: string): Promise<void> {
+/** Guard denials are final; every local command and guarded SSH command needs owner consent. */
+async function admit(command: string, host: string, approval: ExecApproval | undefined, purpose?: string, local = false): Promise<void> {
   const verdict = checkCommand(command)
   if (verdict.verdict === 'deny') {
     throw new Error(`Отказ: команда запрещена (${verdict.reason})`)
   }
-  if (verdict.verdict !== 'confirm') return
+  if (!local && verdict.verdict !== 'confirm') return
   if (approval === undefined) {
     throw new Error('Отказ: команда требует подтверждения, но подтверждение недоступно.')
   }
   const decision = await approval({
     command,
-    reason: `${verdict.reason}; хост ${host}`,
+    reason: `${local ? 'локальная команда требует согласия владельца; ' : ''}${verdict.reason}; хост ${host}`,
     ...(purpose === undefined ? {} : { purpose }),
     purposeRequired: true,
   })
@@ -743,11 +743,29 @@ async function runLocalCommand(
   env: NodeJS.ProcessEnv,
   secrets: readonly string[],
 ): Promise<string> {
-  const bwrap = findExecutable('bwrap', env.PATH)
-  if (bwrap === undefined) throw protectionUnavailable('bwrap не найден в PATH.')
   // DSHBOT_HOST_WRITABLE belongs to the daemon, not to the child environment;
   // it is read on every run, so adding or removing a directory needs no restart.
   const roots = hostWriteRoots(home, process.env)
+  // Resolve before both the bwrap lookup and the shell: a writable PATH entry
+  // could replace even a bare diagnostic (or the write guard itself).
+  const path = (env.PATH ?? '').split(delimiter).flatMap((entry) => {
+    const directory = isAbsolute(entry) ? realDirectory(entry) : undefined
+    return directory !== undefined && !roots.some((root) => isWithin(directory, root) || isWithin(root, directory))
+      ? [directory] : []
+  })
+  if (path.length === 0) throw protectionUnavailable('в PATH нет каталогов вне доступных для записи путей.')
+  env = { ...env, PATH: path.join(delimiter) }
+  const selectedBwrap = findExecutable('bwrap', env.PATH)
+  if (selectedBwrap === undefined) throw protectionUnavailable('bwrap не найден в PATH.')
+  let bwrap: string
+  try {
+    bwrap = realpathSync(selectedBwrap)
+    if (!statSync(bwrap).isFile() || !isExecutable(bwrap) || roots.some((root) => isWithin(bwrap, root))) {
+      throw new Error('mutable or invalid bwrap')
+    }
+  } catch {
+    throw protectionUnavailable('bwrap должен быть обычным исполняемым файлом вне доступных для записи путей.')
+  }
   const mvProblem = mvOutsideWriteRoots(command, cwd, roots)
   if (mvProblem !== undefined) {
     throw new Error(
@@ -796,8 +814,8 @@ export function createHostExecTools(options: HostExecOptions): HostExecTools {
     description:
       'Run a command on one of the owner\'s hosts from DSHBOT_HOME/hosts.json: an ssh target (the owner\'s key, ' +
       'non-interactive) or a local alias (this machine, outside the exec sandbox, so systemctl/journalctl and ' +
-      '/var work). Dangerous commands need the owner to press an approval button. The output is bounded and ' +
-      'the bot\'s own secrets are hidden. Read-only checks (df, journalctl, systemctl status) need no button.',
+      '/var work). Every local command, including read-only checks, needs owner approval. SSH commands follow ' +
+      'the guard and require approval when classified as dangerous. Output is bounded and daemon secrets are hidden.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -847,6 +865,7 @@ export function createHostExecTools(options: HostExecOptions): HostExecTools {
         target.alias,
         options.approval,
         typeof args.purpose === 'string' ? args.purpose : undefined,
+        target.kind === 'local',
       )
       const timeoutMs = clampTimeout(args.timeout_sec, defaultTimeout, maxTimeout)
       const secrets = await secretValues()

@@ -1,12 +1,13 @@
 // Wake-ups of the bot: thinking between tasks (DESIGN §8.2).
 //
-// A wake-up is an ordinary turn of the `main` session, not a separate subsystem:
-// the host asks the same runner for a prompt whose text says that nobody asked,
-// that the turn belongs to the bot and that a pause is a legitimate outcome.
+// A wake-up is an ordinary owner turn, not a separate subsystem: the host asks
+// the same runner, in a transient session of its own that starts without
+// history, for a prompt whose text says that nobody asked, that the turn
+// belongs to the bot and that a pause is a legitimate outcome.
 // This package owns only the clock and the model-facing pieces around that turn:
 //
 //   - the scheduler (bounds 15 min .. 4 h, doubling after a failed wake-up);
-//   - the `set_next_wakeup` tool, present in every turn of `main`;
+//   - the `set_next_wakeup` tool, present in every owner turn;
 //   - the wake-up prompt;
 //   - the wake-up usage ledger (a separate label, no cap).
 
@@ -20,6 +21,7 @@ export {
   normalizeWakeJitter,
   parseWakeJitter,
   type WakeScheduler,
+  type WakeScheduleStorage,
   type WakeSchedulerOptions,
   type WakeTurnOutcome,
 } from './scheduler.js'

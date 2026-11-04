@@ -9,6 +9,7 @@
 // means 09:00 for the owner, whatever the offset or DST does.
 
 import { formatSchedule } from './format.js'
+import { parseSchedule } from './schedule.js'
 import type {
   CreateScheduleInput,
   ScheduleRecord,
@@ -16,7 +17,8 @@ import type {
   ScheduleWatch,
   UpdateScheduleInput,
 } from './jobs.js'
-import { DEFAULT_WATCH_WINDOW_SEC } from './jobs.js'
+import { DEFAULT_WATCH_WINDOW_SEC, SCHEDULE_EFFORTS, SCHEDULE_SUMMARY_DAYS } from './jobs.js'
+import { toolNamesRefusal, type ScheduleToolCatalog } from './tool-names.js'
 
 /** Model-facing shape used by the runner tool seam (kept structural on purpose). */
 export interface ScheduleTool {
@@ -47,6 +49,12 @@ export interface ScheduleToolOptions {
    */
   agents?: ScheduleAgentDirectory
   /**
+   * The tools a run receives. When present, create and update refuse a task
+   * that names a tool the run does not have (a profile run holds only the
+   * profile tools); nothing is saved or changed then.
+   */
+  tools?: ScheduleToolCatalog
+  /**
    * Guard and owner approval for the command of a stream watcher. It throws a
    * refusal (with the reason) when the guard denies the command or the owner
    * declines the card, so nothing is saved and nothing starts. A watch created
@@ -56,8 +64,11 @@ export interface ScheduleToolOptions {
   guardCommand?: (command: string) => Promise<void>
 }
 
-const ACTIONS = ['create', 'watch', 'list', 'remove', 'update', 'pause', 'resume', 'run_now', 'history'] as const
+const ACTIONS = ['create', 'watch', 'list', 'remove', 'update', 'pause', 'resume', 'run_now', 'history', 'summary'] as const
 type Action = (typeof ACTIONS)[number]
+
+/** How much of a task text `list` shows by default; see `listView`. */
+const LIST_TASK_PREVIEW = 200
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
@@ -82,13 +93,25 @@ function normalizeAction(value: unknown): Action {
   if (raw === 'resume' || raw === 'unpause' || raw === 'enable' || raw === 'continue') return 'resume'
   if (raw === 'run_now' || raw === 'run-now' || raw === 'run' || raw === 'trigger' || raw === 'fire') return 'run_now'
   if (raw === 'history' || raw === 'runs' || raw === 'log') return 'history'
+  if (raw === 'summary' || raw === 'stats' || raw === 'report') return 'summary'
   throw new Error(
-    `schedule: неизвестное действие "${raw || 'пусто'}"; допустимы create, list, remove, update, pause, resume, run_now, history.`,
+    `schedule: неизвестное действие "${raw || 'пусто'}"; допустимы create, list, remove, update, pause, resume, run_now, history, summary.`,
   )
 }
 
 function notFound(id: string): Error {
   return new Error(`schedule: задание "${id}" не найдено.`)
+}
+
+/** Refuse a task that names a tool the run will not have. */
+function checkTaskTools(
+  options: ScheduleToolOptions,
+  action: 'create' | 'update',
+  task: string,
+  agent: string,
+): void {
+  const refusal = toolNamesRefusal(action, task, agent, options.tools)
+  if (refusal !== undefined) throw new Error(refusal)
 }
 
 /** Refuse an unknown profile with the same wording for create and update. */
@@ -103,6 +126,48 @@ function checkAgent(
   throw new Error(
     `schedule ${action}: неизвестный профиль агента "${agent}". Доступные профили: ` +
       `${names.length === 0 ? 'нет (задайте DSHBOT_HOME/agents.json)' : names.join(', ')}.`,
+  )
+}
+
+/**
+ * A relative delay in the task text: "через минуту", "через 5 минут", "через
+ * день", "через полчаса", "in 10 minutes", "in a week", "in 2 days". Such a
+ * request is a single action after a delay — a one-shot.
+ *
+ * The unit list has to be as wide as the wording: a day or a week is exactly
+ * the case where a cron hurts most, because the job then repeats the same
+ * action every day at that minute. The trailing `*` swallows the case ending
+ * ("минуту", "дня", "неделю", "days"), and `(?!\p{L})` stops a word that only
+ * begins with a unit ("части", "Germany").
+ */
+const RELATIVE_DELAY =
+  /(?:^|[^\p{L}])(?:через|in)\s+(?:\d+\s*|[aа]\s+)?(?:полчас|секунд|сек|минут|мин|час|день|дн|сут|недел|месяц|год|sec|min|hour|day|week|month)[а-яёa-z]*(?!\p{L})/iu
+
+/**
+ * Refuse a cron spec that carries a one-shot delay in its task. Real case: the
+ * owner wrote "включи свет на 100% через минуту", the job was saved as
+ * `25 0 * * *` and switched the lights on at 00:27 the next night, then every
+ * night. A cron repeats by the clock; a delay happens once, so it belongs to
+ * the spec itself ("2m" or an ISO time), not to the task text.
+ */
+function checkRecurringDelay(
+  action: 'create' | 'update',
+  spec: string,
+  task: string,
+): void {
+  if (!RELATIVE_DELAY.test(task)) return
+  let kind: string
+  try {
+    kind = parseSchedule(spec).kind
+  } catch {
+    // A broken spec is reported by the registry with its own wording.
+    return
+  }
+  if (kind !== 'cron') return
+  throw new Error(
+    `schedule ${action}: расписание "${spec}" повторяется по часам, а в задании разовая задержка ` +
+      `(«через ...»). Задержка — это разовый запуск: укажи её в самом расписании ("2m", "90m" или ` +
+      `ISO-время) и убери повторение. Если повторение действительно нужно, переформулируй задание без задержки.`,
   )
 }
 
@@ -121,6 +186,7 @@ function view(record: ScheduleRecord): Record<string, unknown> {
     deliver: record.deliver,
     watch: record.watch,
     agent: record.agent,
+    effort: record.effort,
     paused: record.paused,
     ...(record.lastSkipAt === null ? {} : { lastSkipAt: record.lastSkipAt.toISOString() }),
     ...(record.lastError === null ? {} : { lastError: record.lastError }),
@@ -132,6 +198,55 @@ function createView(record: ScheduleRecord, displayZone: string): Record<string,
     ? `на паузе; ${formatSchedule(record, displayZone)}`
     : formatSchedule(record, displayZone)
   return { ...view(record), description }
+}
+
+/**
+ * One key for the text of a task: case, runs of spaces and the edges do not
+ * matter when two jobs are compared. Jobs with one key send the owner the same
+ * report twice, so `create` warns about the copy and `list` groups the group.
+ */
+function taskKey(task: string): string {
+  return task.replace(/\s+/gu, ' ').trim().toLowerCase()
+}
+
+/**
+ * The answer of a create: the new job, plus a warning when the same task text is
+ * already scheduled. That is how the owner's chat got two neurokey watchers with
+ * one text, and the copy is cheapest to catch at the very call that makes it.
+ */
+function createdView(
+  record: ScheduleRecord,
+  others: readonly ScheduleRecord[],
+  displayZone: string,
+): Record<string, unknown> {
+  const created = createView(record, displayZone)
+  const twins = others
+    .filter((other) => other.id !== record.id && taskKey(other.task) === taskKey(record.task))
+    .map((other) => other.id)
+  if (twins.length === 0) return created
+  return {
+    ...created,
+    twins,
+    hint:
+      `такое же задание уже есть: ${twins.join(', ')} — похожие задания присылают один отчёт несколько раз; ` +
+      'если это тот же сторож, оставь одно (action remove для лишнего).',
+  }
+}
+
+/**
+ * `list` is read for the ids and the schedule, not for the whole text of every
+ * task: with two dozen dev jobs the full dump ran to ~20k characters in one
+ * answer and ate the context. A task longer than LIST_TASK_PREVIEW is shortened
+ * and its real length kept in `taskChars`; `full: true` returns it untouched.
+ * Finished jobs (nextRunAt null) are left out of the list unless `all: true`:
+ * they cannot fire again, so their id and schedule only pad the answer. Jobs
+ * that repeat one another are grouped in `repeats`: two identical tasks send the
+ * owner the same report twice, and the list is where the copy shows up.
+ */
+function listView(record: ScheduleRecord, displayZone: string, full: boolean): Record<string, unknown> {
+  const base = createView(record, displayZone)
+  if (full || record.task.length <= LIST_TASK_PREVIEW) return base
+  return { ...base, task: `${record.task.slice(0, LIST_TASK_PREVIEW)}…`, taskChars: record.task.length }
 }
 
 /** Validate the watch fields of `create`/`update` before the guard and the store see them. */
@@ -185,83 +300,78 @@ export function createScheduleTool(options: ScheduleToolOptions): ScheduleTool {
         type: 'string',
         enum: [...ACTIONS],
         description:
-          'create a job, watch a long command stream, list the saved jobs, remove one by id, update, pause, ' +
-          'resume, run once now, or show history',
+          'watch streams a long command; summary counts runs of 7 days; the rest need id except create and list.',
       },
       schedule: {
         type: 'string',
         description:
-          `When to run, in the owner's time zone (${zone}) — do not convert it to UTC yourself. ` +
-          'Interval "every 30m", one-shot "30m" or ISO 8601 "2026-12-01T09:00:00" in the job zone; ' +
-          'an explicit Z or numeric offset keeps its absolute instant. ' +
-          `Five-field cron "0 9 * * 1-5" (09:00 in ${zone}).`,
+          `In the owner's zone (${zone}), not UTC: "every 30m", one-shot "30m", ISO 8601 ` +
+          '"2026-12-01T09:00:00" (an explicit Z or offset keeps its instant) or cron "0 9 * * 1-5".',
       },
       task: {
         type: 'string',
-        description: 'What the planned turn must do, written as a complete instruction.',
+        description: 'Instruction for the planned turn.',
       },
       tz: {
         type: 'string',
-        description:
-          `IANA time zone of the job (e.g. "Europe/Moscow"); defaults to the owner's zone (${zone}). ` +
-          'Cron and wall-clock times of the job are read in it.',
+        description: `IANA zone of the job; default the owner's (${zone}).`,
       },
       until: {
         type: 'string',
-        description:
-          'Optional end: an ISO 8601 moment (e.g. "2026-12-01T12:00:00Z") or epoch milliseconds. ' +
-          'The job is removed at that moment and the owner gets one line; nothing runs after it.',
+        description: 'Optional end, ISO 8601 or epoch ms: the job is removed then.',
       },
       max_runs: {
         type: 'integer',
         minimum: 1,
-        description: 'Optional end: remove the job after this many planned runs and tell the owner once.',
+        description: 'Optional: remove the job after this many runs.',
       },
       idleOnly: {
         type: 'boolean',
-        description: 'Wait for the owner turn to finish before the planned turn starts.',
+        description: 'Start only after the owner turn ends.',
       },
       check: {
         type: 'string',
         description:
-          'Optional shell command run before the planned turn in the same sandbox as exec. Empty output or a ' +
-          'last JSON line with the explicit no-work signal means no model call and the tick is marked skipped. ' +
-          'Nonzero exit or timeout is recorded as lastError and never starts a turn.',
+          'Exec-sandbox precheck: empty output or last-line no-work JSON skips the tick; exit failure/timeout sets lastError.',
       },
       deliver: {
         type: 'string',
         enum: ['turn', 'raw'],
         description:
-          'How the result reaches the owner: "turn" (default) starts a planned turn with the output as ' +
-          'untrusted context; "raw" sends the lines to the owner as plain text without a model call. For a ' +
-          'checked job "raw" requires check; for a watch it is the default.',
+          'turn: check output as untrusted model context (default). raw: lines to owner without model; needs check, default for watch.',
       },
       command: {
         type: 'string',
-        description:
-          'Shell command of a stream watch (action "watch"): a long-running command kept alive in the exec ' +
-          'sandbox (for example "journalctl -f" or "tail -f app.log"). It is checked by the command guard.',
+        description: 'Watch: long-running exec-sandbox command, checked by the command guard.',
       },
       pattern: {
         type: 'string',
-        description:
-          'Regular expression of a stream watch: only output lines that match it are delivered to the owner.',
+        description: 'Watch: only output lines matching this regular expression are delivered.',
       },
       window_sec: {
         type: 'number',
-        description:
-          'Batch window of a stream watch in seconds: matches inside one window are collected into one ' +
-          'delivery. Default 30.',
+        description: 'Watch: batch window in seconds (default 30).',
       },
       agent: {
         type: 'string',
         description:
-          'Optional name of an agent profile from agents.json (list with /tools). The planned turn then runs ' +
-          'in that profile: only its tools, its instructions and its model, instead of main. An unknown name is refused.',
+          'Optional agents.json profile: its tools, instructions and model.',
+      },
+      effort: {
+        type: 'string',
+        description: `Reasoning level of this job: ${SCHEDULE_EFFORTS.join(', ')}.`,
       },
       id: {
         type: 'string',
-        description: 'Id of the job to remove, as returned by create or list.',
+        description: 'Job id from create or list.',
+      },
+      full: {
+        type: 'boolean',
+        description: `List: full task text; default preview is ${LIST_TASK_PREVIEW} chars, original length in taskChars.`,
+      },
+      all: {
+        type: 'boolean',
+        description: 'List: include finished jobs (nextRunAt null); otherwise only their count in finished.',
       },
     },
     required: ['action'],
@@ -271,19 +381,9 @@ export function createScheduleTool(options: ScheduleToolOptions): ScheduleTool {
   return {
     name: 'schedule',
     description:
-      'Плановые задания бота: создаёт, перечисляет, изменяет, ставит на паузу и возобновляет, запускает сейчас и ' +
-      'показывает историю запусков. Время в расписании указывай в часовом поясе ' +
-      `владельца (${zone}) без ручного пересчёта в UTC: cron "0 9 * * 1-5" — это 09:00 у владельца. ` +
-      'Созданное задание сохраняется в хранилище и переживает перезапуск демона; когда срок наступает, бот ' +
-      'выполняет текст задания в плановом ходе и присылает владельцу итог (или молчит, если итог — [SILENT]). ' +
-      'Для задания с ограничением укажи until (момент) и/или max_runs: по достижении задание снимается само ' +
-      'и владелец получает одну строку. Подтверждения в плановом ходе не запрашиваются: такой вызов сразу ' +
-      'получает отказ. Дешёвый монитор задавай через check — детерминированную shell-команду в песочнице ' +
-      'exec; пустой тик не будит модель. deliver: "raw" отправляет stdout проверки владельцу без модели ' +
-      '(нужен check). Для долгой команды (journalctl -f, tail -f) задавай action "watch" с command, pattern ' +
-      '(регулярное выражение), window_sec (окно пачки) и deliver: команда идёт через песочницу exec, ' +
-      'совпадения приходят владельцу пачкой, а при падении команда перезапускается с растущей задержкой. ' +
-      'Список сначала: не дублируй существующее задание.',
+      `Persistent jobs in ${zone}, not UTC. Results go to owner unless [SILENT]. until/max_runs remove jobs with notice. ` +
+      'Relative delays ("5m") are one-shot, never cron. Planned turns cannot request confirmation. ' +
+      'check skips empty ticks; watch streams matches in batches and restarts failures with backoff. List before creating to avoid duplicates.',
     inputSchema,
     async execute(args: Record<string, unknown>): Promise<string> {
       const action = normalizeAction(args.action)
@@ -297,6 +397,8 @@ export function createScheduleTool(options: ScheduleToolOptions): ScheduleTool {
         const tz = text(args.tz) || text(args.timezone)
         const agent = text(args.agent)
         checkAgent(options, 'create', agent)
+        if (task !== '') checkTaskTools(options, 'create', task, agent)
+        const effort = text(args.effort)
         const input: CreateScheduleInput = {
           spec,
           task: task === '' ? `Наблюдение за потоком: ${watch.command}` : task,
@@ -305,8 +407,9 @@ export function createScheduleTool(options: ScheduleToolOptions): ScheduleTool {
         }
         if (tz !== '') input.tz = tz
         if (agent !== '') input.agent = agent
+        if (effort !== '') input.effort = effort
         const record = registry.create(input)
-        return JSON.stringify(createView(record, zone), null, 2)
+        return JSON.stringify(createdView(record, registry.list(), zone), null, 2)
       }
       if (action === 'create') {
         const spec = text(args.schedule)
@@ -319,6 +422,9 @@ export function createScheduleTool(options: ScheduleToolOptions): ScheduleTool {
         const check = text(args.check)
         const agent = text(args.agent)
         checkAgent(options, 'create', agent)
+        checkTaskTools(options, 'create', task, agent)
+        checkRecurringDelay('create', spec, task)
+        const effort = text(args.effort)
         const deliverRaw = text(args.deliver).toLowerCase()
         if (deliverRaw !== '' && deliverRaw !== 'turn' && deliverRaw !== 'raw') {
           throw new Error('schedule create: deliver должен быть "turn" или "raw".')
@@ -333,6 +439,7 @@ export function createScheduleTool(options: ScheduleToolOptions): ScheduleTool {
         if (until !== undefined) input.until = until
         if (check !== '') input.check = check
         if (agent !== '') input.agent = agent
+        if (effort !== '') input.effort = effort
         if (deliverRaw === 'raw') input.deliver = 'raw'
         else if (deliverRaw === 'turn') input.deliver = 'turn'
         if (maxRuns !== undefined) {
@@ -342,12 +449,66 @@ export function createScheduleTool(options: ScheduleToolOptions): ScheduleTool {
           input.maxRuns = maxRuns
         }
         const record = registry.create(input)
-        return JSON.stringify(createView(record, zone), null, 2)
+        return JSON.stringify(createdView(record, registry.list(), zone), null, 2)
       }
 
       if (action === 'list') {
-        const jobs = registry.list().map((record) => createView(record, zone))
-        return JSON.stringify({ timeZone: zone, jobs }, null, 2)
+        const full = args.full === true
+        const all = args.all === true
+        const records = registry.list()
+        // A record with nextRunAt null has run out (one-shot fired, or until/max_runs
+        // removed it): it can neither fire again nor start a turn. Two dozen dev jobs
+        // made those dead rows a third of the answer, so they stay out unless asked.
+        const finished = records.filter((record) => record.nextRunAt === null)
+        const listed = all ? records : records.filter((record) => record.nextRunAt !== null)
+        const jobs = listed.map((record) => listView(record, zone, full))
+        const shortened = jobs.filter((job) => 'taskChars' in job).length
+        const hints: string[] = []
+        if (shortened > 0) {
+          hints.push(
+            `task сокращён до ${LIST_TASK_PREVIEW} символов у ${shortened} заданий, полная длина — в taskChars; ` +
+              'полный текст — action list с full: true.',
+          )
+        }
+        if (finished.length > 0) {
+          hints.push(
+            all
+              ? `в списке ${finished.length} выполненных заданий (nextRunAt null) — они уже не запустятся.`
+              : `скрыто выполненных заданий: ${finished.length} (nextRunAt null); они не запустятся, полный ` +
+                  'список — action list с all: true.',
+          )
+        }
+        // Two jobs with the same task text send the owner the same report twice: he
+        // has to read it twice and the schedule list looks twice as long as it is.
+        // The answer already carries every task, so the check is one pass here.
+        const byTask = new Map<string, string[]>()
+        for (const record of listed) {
+          const key = taskKey(record.task)
+          if (key === '') continue
+          const ids = byTask.get(key)
+          if (ids === undefined) byTask.set(key, [record.id])
+          else ids.push(record.id)
+        }
+        const repeats = [...byTask.values()].filter((ids) => ids.length > 1)
+        if (repeats.length > 0) {
+          const shown = repeats
+            .slice(0, 3)
+            .map((ids) => ids.join('/'))
+            .join(', ')
+          hints.push(
+            `одинаковое задание у ${repeats.length} групп (${shown}${repeats.length > 3 ? ', …' : ''}) — ` +
+              'каждая группа присылает владельцу один и тот же отчёт несколько раз; лишние снять или переписать.',
+          )
+        }
+        const payload: Record<string, unknown> = { timeZone: zone, jobs }
+        if (finished.length > 0 && !all) payload.finished = finished.length
+        if (repeats.length > 0) payload.repeats = repeats
+        if (hints.length > 0) payload.hint = hints.join(' ')
+        return JSON.stringify(payload, null, 2)
+      }
+
+      if (action === 'summary') {
+        return JSON.stringify({ days: SCHEDULE_SUMMARY_DAYS, jobs: registry.summary() }, null, 2)
       }
 
       const id = text(args.id)
@@ -389,17 +550,22 @@ export function createScheduleTool(options: ScheduleToolOptions): ScheduleTool {
             watch.deliver = deliverRaw
           }
           const input: UpdateScheduleInput = { watch }
+          if (args.effort !== undefined) input.effort = text(args.effort)
           const spec = text(args.schedule)
           if (spec !== '') input.spec = spec
           const task = text(args.task)
-          if (task !== '') input.task = task
+          if (task !== '') {
+            checkTaskTools(options, 'update', task, existing.agent ?? '')
+            input.task = task
+          }
           if (
             Object.keys(watch).length === 0 &&
             input.spec === undefined &&
-            input.task === undefined
+            input.task === undefined &&
+            input.effort === undefined
           ) {
             throw new Error(
-              'schedule update наблюдателя: укажи хотя бы одно поле — command, pattern, window_sec, deliver, task.',
+              'schedule update наблюдателя: укажи хотя бы одно поле — command, pattern, window_sec, deliver, task, effort.',
             )
           }
           const record = registry.update(id, input)
@@ -410,7 +576,12 @@ export function createScheduleTool(options: ScheduleToolOptions): ScheduleTool {
         const spec = text(args.schedule)
         if (spec !== '') input.spec = spec
         const task = text(args.task)
-        if (task !== '') input.task = task
+        if (task !== '') {
+          const agentAfter = args.agent !== undefined ? text(args.agent) : (existing.agent ?? '')
+          checkAgent(options, 'update', agentAfter)
+          checkTaskTools(options, 'update', task, agentAfter)
+          input.task = task
+        }
         const tz = text(args.tz) || text(args.timezone)
         if (tz !== '') input.tz = tz
         const until = numberOrText(args.until)
@@ -435,12 +606,16 @@ export function createScheduleTool(options: ScheduleToolOptions): ScheduleTool {
           }
           input.deliver = deliverRaw === 'raw' ? 'raw' : 'turn'
         }
+        if (args.effort !== undefined) input.effort = text(args.effort)
         if (args.idleOnly !== undefined) input.idleOnly = args.idleOnly === true
         if (Object.keys(input).length === 0) {
           throw new Error(
-            'schedule update: укажи хотя бы одно поле — schedule, task, tz, until, max_runs, check, deliver, agent.',
+            'schedule update: укажи хотя бы одно поле — schedule, task, tz, until, max_runs, check, deliver, agent, effort.',
           )
         }
+        // The effective pair after the change, so a new task on an old cron is
+        // checked as strictly as a new job.
+        checkRecurringDelay('update', input.spec ?? existing.spec, input.task ?? existing.task)
         const record = registry.update(id, input)
         if (record === null) throw notFound(id)
         return JSON.stringify(createView(record, zone), null, 2)

@@ -81,6 +81,7 @@ async function run(host: string, command: string): Promise<string> {
     home: scratch,
     secrets: [],
     timeoutMs: 20_000,
+    approval: async () => 'allow', // This fixture tests environment isolation after owner consent.
   });
   const tool = tools[0];
   if (tool === undefined) throw new Error("host_exec is not created");
@@ -147,7 +148,7 @@ test("test_h1_local_alias_keeps_the_ordinary_environment_of_a_command", async ()
   expect(output).toContain(`home=${saved.HOME ?? process.env.HOME}`);
   expect(output).toMatch(/^path=.+$/m);
   expect(output).toContain(`sock=${AUTH_SOCK_VALUE}`);
-  expect(output).toContain(join(fakeBin, "ssh"));
+  expect(output).not.toContain(fakeBin);
 });
 
 test("test_h1_ssh_client_environment_has_no_model_key_bot_token_or_other_secrets_in_any_form", async () => {
@@ -203,3 +204,47 @@ test("test_h1_host_starting_with_a_dash_never_starts_ssh", async () => {
 
   expect(existsSync(join(scratch, "ssh-started"))).toBe(false);
 });
+
+test('c6 host_exec does not acquire the sandbox tools path or installer variables', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dshbot-host-tools-'))
+  const fakeBin = join(home, 'fake-bin')
+  const toolsBin = join(home, 'tools', 'bin')
+  const previousPath = process.env.PATH
+  try {
+    mkdirSync(fakeBin)
+    mkdirSync(toolsBin, { recursive: true })
+    writeFileSync(join(fakeBin, 'ssh'), '#!/bin/sh\nenv\n')
+    chmodSync(join(fakeBin, 'ssh'), 0o755)
+    writeFileSync(join(toolsBin, 'ffmpeg'), '#!/bin/sh\necho WRONG-FFMPEG\n')
+    chmodSync(join(toolsBin, 'ffmpeg'), 0o755)
+    writeFileSync(join(home, 'hosts.json'), JSON.stringify({ remote: { user: 'test', host: '192.0.2.10' } }))
+    process.env.PATH = [fakeBin, previousPath ?? '/usr/bin:/bin'].join(delimiter)
+    const { tools } = createHostExecTools({ home, secrets: [], timeoutMs: 20_000 })
+    const result = String(await tools[0]!.execute({ host: 'remote', command: 'env' }, { signal: new AbortController().signal }))
+    expect(result).toMatch(/^PATH=.+$/m)
+    expect(result).not.toContain(toolsBin)
+    for (const name of ['UV_TOOL_DIR', 'UV_TOOL_BIN_DIR', 'PYTHONUSERBASE', 'NPM_CONFIG_PREFIX', 'CARGO_INSTALL_ROOT', 'GOBIN', 'UV_CACHE_DIR', 'PIP_CACHE_DIR', 'npm_config_cache', 'GOMODCACHE', 'GOCACHE']) {
+      expect(result).not.toMatch(new RegExp(`^${name}=`, 'm'))
+    }
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH
+    else process.env.PATH = previousPath
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('host output masking refreshes the provider vault while always masking daemon keys', async () => {
+  writeHosts({ box: { local: true } })
+  const provider = 'PROVIDER-VAULT-SECRET-VALUE'
+  let values: readonly string[] = []
+  const { tools } = createHostExecTools({ home: scratch, secrets: () => values, timeoutMs: 20_000, approval: async () => 'allow' })
+  const print = async () => String(await tools[0]!.execute({ host: 'box', command: `printf '%s|%s|%s|ok' '${provider}' '${TELEGRAM_VALUE}' '${DEEPSEEK_VALUE}'` }, { signal: new AbortController().signal }))
+  const before = await print()
+  expect(before).toContain(provider)
+  expect(before).not.toContain(TELEGRAM_VALUE)
+  expect(before).not.toContain(DEEPSEEK_VALUE)
+  values = [provider]
+  const after = await print()
+  expect(after).toContain('ok')
+  for (const value of [provider, TELEGRAM_VALUE, DEEPSEEK_VALUE]) expect(after).not.toContain(value)
+})

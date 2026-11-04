@@ -49,22 +49,12 @@ test('a directory or root footprint that contains a risky path is high with a re
     expect(assessment.reason, `footprint ${JSON.stringify(entry)}`).toMatch(/^Причина: footprint задевает рисковые пути/)
     expect(assessment.reason).toMatch(reason)
   }
-})
-
-test('a risky entry itself and a path inside a risky directory stay high', () => {
-  for (const entry of ['migrations/', 'db/migrations/001-add.sql', '.github/workflows/', '.github/workflows/ci.yml', 'config/secret.txt', 'secrets/']) {
-    expect(risk([entry]).risk, entry).toBe('high')
-  }
-})
-
-test('a footprint outside the project root is high and says so', () => {
   for (const entry of ['../other/src.ts', 'src/../../other/', '/etc/hosts']) {
     const assessment = risk([entry])
     expect(assessment.risk, entry).toBe('high')
     expect(assessment.reason, entry).toMatch(/выходит за корень проекта/)
   }
 })
-
 test('files and directories without risky paths below them stay low', () => {
   for (const footprint of [['src/search.ts'], ['src/'], ['docs'], ['db/schema.ts'], ['.github/dependabot.yml'], [`${PROJECT}/src/search.ts`], ['./src/search.ts']]) {
     expect(risk(footprint), footprint.join(',')).toEqual({ risk: 'low' })
@@ -163,4 +153,18 @@ test('the analysis flow raises the parent of a tracked migrations directory, an 
   expect(whole.card).toMatch(/workflow/)
 
   expect((await analysedRisk(['src/'])).risk).toBe('low')
+})
+
+test('ignored-directory risk scans preserve case and fail closed on error or budget exhaustion', () => {
+  for (const scan of [() => ['Config/secrets.json'], () => undefined, () => ['Config/a', 'Config/b']]) {
+    const scanned: string[] = []
+    const assessment = assessFactoryRisk({
+      body: 'Update config', modelRisk: 'low', projectRoot: PROJECT, projectPaths: ['Config/', 'config/public.json'],
+      footprint: ['config/'], ignoredDirectories: ['Config/'], ignoredScanLimit: 1,
+      scanIgnoredDirectory: (path) => { scanned.push(path); return scan() },
+    })
+    expect(scanned).toEqual(['Config'])
+    expect(assessment.risk).toBe('high')
+    expect(assessment.reason).toBeTruthy()
+  }
 })

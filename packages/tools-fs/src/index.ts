@@ -63,7 +63,7 @@ import {
   type Dirent,
   type Stats,
 } from 'node:fs'
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 
 import { frameData } from '../../app/src/untrusted-frame.js'
@@ -528,6 +528,8 @@ export function createFsTools(options: FsToolOptions): FsTool[] {
     return { path: realPathOf(spec.path), readOnly: spec.readOnly === true }
   })
   const protectedRoot = realPathOf(options.protectedRoot ?? join(home, 'app'))
+  const candidatesRoot = realPathOf(join(home, 'candidates'))
+  const lexicalCandidatesRoot = resolve(join(home, 'candidates'))
   const fallbackRoot = roots[0] as Root
   // The previous versions of files the tools change live here; `/rollback`
   // reads the same directory. It is outside the roots, so the model itself
@@ -572,10 +574,13 @@ export function createFsTools(options: FsToolOptions): FsTool[] {
   const rootsSummary = `Roots: ${roots
     .map((root) =>
       root.readOnly
-        ? `${root.path} (read-only: read only, no writes)`
-        : `${root.path} (read-write: read and write)`,
+        ? `${root.path} (ro)`
+        : `${root.path} (rw)`,
     )
-    .join('; ')}. Relative paths resolve against ${fallbackRoot.path}.`
+    .join(', ')}; relative paths start at ${fallbackRoot.path}.`
+
+  // Only `read` spells the roots out; its siblings point at it to keep the tools array small.
+  const rootsSeeRead = 'Roots and relative paths: as in read.'
 
   const readStamps = new Map<string, ReadStamp>()
 
@@ -602,7 +607,7 @@ export function createFsTools(options: FsToolOptions): FsTool[] {
    * dangling symlink, so a link that points out of the roots is refused instead
    * of being replaced by a rename.
    */
-  function locateForWrite(input: string): { real: string; root: Root } {
+  function locateForWrite(input: string): { absolute: string; real: string; root: Root } {
     const absolute = absolutePath(input)
     let real = realPathOf(absolute)
     try {
@@ -616,12 +621,32 @@ export function createFsTools(options: FsToolOptions): FsTool[] {
     const root = matchRoot(real, roots)
     if (root === undefined) throw new Error(`path is outside the allowed roots: ${absolute}`)
     refuseHidden(real)
-    return { real, root }
+    return { absolute, real, root }
   }
 
-  function refuseProtected(real: string): void {
-    if (isProtected(real, protectedRoot)) {
-      throw new Error(`path is protected by the charter and cannot be edited: ${real}`)
+  /**
+   * The repository `guard.isProtected` resolves `path` against: a candidate
+   * worktree under `<home>/candidates/<id>` is its own repository, anything else
+   * belongs to the live checkout. The candidates directory is matched both by its
+   * real path and as written, so a path that keeps its symlinks is classified too.
+   */
+  function protectedRootOf(path: string): string {
+    for (const base of [candidatesRoot, lexicalCandidatesRoot]) {
+      const inside = relative(base, path)
+      if (inside === '' || inside === '..' || inside.startsWith(`..${sep}`) || isAbsolute(inside)) continue
+      return join(base, inside.split(sep)[0] as string)
+    }
+    return protectedRoot
+  }
+
+  /**
+   * Refuse when the path as written (lexically, no symlink resolved in any
+   * component) or its resolved target is protected: a link inside a protected
+   * directory must not move the write out of it.
+   */
+  function refuseProtected(absolute: string, real: string): void {
+    if (isProtected(absolute, protectedRootOf(absolute)) || isProtected(real, protectedRootOf(real))) {
+      throw new Error(`path is protected by the charter and cannot be edited: ${absolute === real ? real : `${absolute} (${real})`}`)
     }
   }
 
@@ -918,15 +943,15 @@ export function createFsTools(options: FsToolOptions): FsTool[] {
   const readTool: FsTool = {
     name: READ_TOOL_NAME,
     description:
-      'Read a text file and return its lines with 1-based line numbers. Use offset and limit to page ' +
-      'through large files. Binary files are described instead of returned. ' +
+      'Read a text file with 1-based line numbers; page large files with offset and limit. ' +
+      'Binary files are described, not returned. ' +
       rootsSummary,
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'File path; absolute or relative to the workspace.' },
-        offset: { type: 'integer', minimum: 1, description: 'First line to return, 1-based. Default 1.' },
-        limit: { type: 'integer', minimum: 1, description: `Maximum number of lines, default ${DEFAULT_LINE_LIMIT}.` },
+        path: { type: 'string', description: 'File path.' },
+        offset: { type: 'integer', minimum: 1, description: 'First line, 1-based. Default 1.' },
+        limit: { type: 'integer', minimum: 1, description: `Max lines, default ${DEFAULT_LINE_LIMIT}.` },
       },
       required: ['path'],
       additionalProperties: false,
@@ -956,17 +981,17 @@ export function createFsTools(options: FsToolOptions): FsTool[] {
   const editTool: FsTool = {
     name: EDIT_TOOL_NAME,
     description:
-      'Replace exactly one occurrence of old_string with new_string in an existing file, or create a file ' +
-      'with content. An existing file must have been read in this session and must be unchanged since that ' +
-      'read. Protected paths are never written and writes are atomic. ' +
-      rootsSummary,
+      'Replace the single occurrence of old_string with new_string in a file, or create a file with ' +
+      'content. An existing file must be read in this session and unchanged since. ' +
+      'Protected paths are never written. ' +
+      rootsSeeRead,
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'File path; absolute or relative to the workspace.' },
-        old_string: { type: 'string', description: 'Exact text to replace; must occur exactly once.' },
-        new_string: { type: 'string', description: 'Replacement text; empty string deletes the match.' },
-        content: { type: 'string', description: 'Whole content when creating a new file.' },
+        path: { type: 'string', description: 'File path.' },
+        old_string: { type: 'string', description: 'Exact text, must occur once.' },
+        new_string: { type: 'string', description: 'Replacement; empty deletes.' },
+        content: { type: 'string', description: 'Whole content of a new file.' },
       },
       required: ['path'],
       additionalProperties: false,
@@ -974,8 +999,8 @@ export function createFsTools(options: FsToolOptions): FsTool[] {
     execute(args) {
       const input = stringArg(args, 'path')
       if (input === undefined) throw new Error('path is required')
-      const { real, root } = locateForWrite(input)
-      refuseProtected(real)
+      const { absolute, real, root } = locateForWrite(input)
+      refuseProtected(absolute, real)
       if (root.readOnly) throw new Error(`path is in a read-only root and cannot be edited: ${input}`)
 
       let stats: ReturnType<typeof statSync> | undefined
@@ -1020,8 +1045,8 @@ export function createFsTools(options: FsToolOptions): FsTool[] {
         )
       }
       const append = args.append === true
-      const { real, root } = locateForWrite(input)
-      refuseProtected(real)
+      const { absolute, real, root } = locateForWrite(input)
+      refuseProtected(absolute, real)
       if (root.readOnly) throw new Error(`path is in a read-only root and cannot be written: ${input}`)
 
       let stats: Stats | undefined
@@ -1060,21 +1085,19 @@ export function createFsTools(options: FsToolOptions): FsTool[] {
   const listTool: FsTool = {
     name: LIST_TOOL_NAME,
     description:
-      'List a directory without reading file contents: the first line is the absolute path of the listed ' +
-      'directory ("Каталог: <path>") and every entry line follows with its kind (dir, file or link), path ' +
-      'relative to that base and size in bytes. Entries are sorted by name; use ' +
-      `recursive to descend and glob (for example "*.md" or "**/*.ts") to filter. At most ${LIST_LIMIT} ` +
-      'entries are returned and the answer says when it was cut. Symlinks are shown but never followed. ' +
-      rootsSummary,
+      'List a directory: first line "Каталог: <absolute path>", then one line per entry: kind (dir, file, ' +
+      'link), path relative to it, size in bytes. Sorted by name; recursive descends, glob filters. ' +
+      `At most ${LIST_LIMIT} entries (the answer says when cut). Symlinks are not followed. ` +
+      rootsSeeRead,
     inputSchema: {
       type: 'object',
       properties: {
         path: {
           type: 'string',
-          description: 'Directory or file; absolute or relative to the first root. Default: the workspace root.',
+          description: 'Directory or file. Default: the workspace root.',
         },
-        glob: { type: 'string', description: 'Glob filter over the names, e.g. "*.md" or "**/*.ts".' },
-        recursive: { type: 'boolean', description: 'Descend into subdirectories. Default false.' },
+        glob: { type: 'string', description: 'Name filter, e.g. "*.md" or "**/*.ts".' },
+        recursive: { type: 'boolean', description: 'Descend into subdirectories.' },
       },
       additionalProperties: false,
     },
@@ -1120,22 +1143,20 @@ export function createFsTools(options: FsToolOptions): FsTool[] {
   const grepTool: FsTool = {
     name: GREP_TOOL_NAME,
     description:
-      'Search file contents with a regular expression and return one "path:line:text" row per matching ' +
-      'line, where path is the absolute path of the file. The path may be a file or a directory; glob ' +
-      'filters the files (for example "*.ts"). Binary ' +
-      `files (a NUL byte in the first 8 KB) and files over 2 MB are skipped, as are node_modules and .git ` +
-      `unless the path itself names them. At most ${GREP_MATCH_LIMIT} matches and ${GREP_FILE_LIMIT} files ` +
-      'are examined; the answer says when it was cut. Protected paths are never read. ' +
-      rootsSummary,
+      'Search file contents by regex; one "absolute path:line:text" row per match. The path is a file or ' +
+      'directory. Binary files, files over 2 MB, node_modules and .git (unless named) are skipped. ' +
+      `At most ${GREP_MATCH_LIMIT} matches and ${GREP_FILE_LIMIT} files (the answer says when cut). ` +
+      'Protected paths are never read. ' +
+      rootsSeeRead,
     inputSchema: {
       type: 'object',
       properties: {
-        regex: { type: 'string', description: 'Regular expression to search for in each line.' },
+        regex: { type: 'string', description: 'Regular expression matched per line.' },
         path: {
           type: 'string',
-          description: 'File or directory; absolute or relative to the first root. Default: the workspace root.',
+          description: 'File or directory. Default: the workspace root.',
         },
-        glob: { type: 'string', description: 'Glob filter over file names, e.g. "*.ts".' },
+        glob: { type: 'string', description: 'File name filter, e.g. "*.ts".' },
       },
       required: ['regex'],
       additionalProperties: false,

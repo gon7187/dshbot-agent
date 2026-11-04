@@ -145,6 +145,13 @@ export interface LearningOptions {
    * tool whitelist; tests count the calls instead of calling a model.
    */
   launchReview: (prompt: string) => Promise<void> | void
+  /**
+   * True while an owner turn runs. No review starts then, whether it is a new
+   * one or the follow-up of a finished one: it waits for the owner's answer.
+   */
+  isOwnerBusy?: () => boolean
+  /** Delay of a review registered by `requestReview`, and the recheck step while the owner is busy. */
+  reviewStartDelayMs?: number
   /** Override of the curator cadence, for tests. */
   curatorIntervalMs?: number
   curatorIdleMs?: number
@@ -198,6 +205,12 @@ export interface Learning {
   externalSkillsHint(): string
   /** Starts the review in the background; never throws and never blocks a turn. */
   startReview(context: ReviewContext): void
+  /**
+   * Registers a review reason to start after a short delay. All reasons that
+   * arrive while a review runs or while the delayed start waits are one
+   * pending review, so they give exactly one review.
+   */
+  requestReview(context: ReviewContext): void
   /** Starts the periodic curator and returns its stop function. */
   startCurator(): () => void
   /** The deterministic curator, for tests and diagnostics. */
@@ -357,11 +370,30 @@ export function createLearning(options: LearningOptions): Learning {
     )
   }
 
-  const startReview = (context: ReviewContext): void => {
-    if (reviewInFlight) {
-      log('experience review is already running; this nudge is skipped')
+  // One pending review for every reason that arrives before it can start.
+  let pendingReview: ReviewContext | undefined
+  let startTimer: ReturnType<typeof setTimeout> | undefined
+  const startDelayMs = options.reviewStartDelayMs ?? 500
+
+  const armStartTimer = (): void => {
+    if (startTimer !== undefined) return
+    startTimer = setTimeout(() => {
+      startTimer = undefined
+      pump()
+    }, startDelayMs)
+    startTimer.unref?.()
+  }
+
+  // The only place where a review starts: never during a review, while a
+  // delayed start waits, or while an owner turn runs.
+  const pump = (): void => {
+    if (pendingReview === undefined || reviewInFlight || startTimer !== undefined) return
+    if (options.isOwnerBusy?.() === true) {
+      armStartTimer()
       return
     }
+    const context = pendingReview
+    pendingReview = undefined
     reviewInFlight = true
     const prompt = buildExperienceReviewPrompt({ ...context, skillsIndex: context.skillsIndex ?? skillsIndex() })
     const run = (async (): Promise<void> => {
@@ -371,10 +403,24 @@ export function createLearning(options: LearningOptions): Learning {
         log(`experience review failed: ${error instanceof Error ? error.message : String(error)}`)
       } finally {
         reviewInFlight = false
+        pump()
       }
     })()
     running.add(run)
     void run.finally(() => running.delete(run))
+  }
+
+  const startReview = (context: ReviewContext): void => {
+    // The counters are already reset: the reason is kept, and any number of
+    // reasons during one review give exactly one follow-up review.
+    if (reviewInFlight) log('experience review is already running; one more review follows it')
+    pendingReview = context
+    pump()
+  }
+
+  const requestReview = (context: ReviewContext): void => {
+    pendingReview = context
+    if (!reviewInFlight) armStartTimer()
   }
 
   const startCurator = (): (() => void) => {
@@ -435,10 +481,15 @@ export function createLearning(options: LearningOptions): Learning {
     proposalVersion: () => proposals.version(),
     externalSkillsHint,
     startReview,
+    requestReview,
     startCurator,
     curator: () => curator,
     async stop(): Promise<void> {
-      await Promise.allSettled([...running])
+      // A delayed start is dropped; a finished review may start the queued one: wait until none is left.
+      if (startTimer !== undefined) clearTimeout(startTimer)
+      startTimer = undefined
+      pendingReview = undefined
+      while (running.size > 0) await Promise.allSettled([...running])
     },
   }
 }

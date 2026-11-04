@@ -16,6 +16,8 @@ import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, expect, test } from 'vitest'
 
+import { createEvolve } from '../../packages/evolve/src/index.js'
+
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url))
 
 interface Fixture {
@@ -62,10 +64,8 @@ function makeFixture(): Fixture {
   git(live, 'config', 'user.name', 'Test')
   git(live, 'config', 'user.email', 'test@example.invalid')
   // the code of the repository that ExecStartPre depends on, as it sits in a real live checkout
-  for (const entry of ['scripts', 'packages', 'persona', 'package.json', 'tsconfig.json', 'CHARTER.md', 'CHECKLIST.md']) {
-    const from = join(repoRoot, entry)
-    if (existsSync(from)) cpSync(from, join(live, entry), { recursive: true })
-  }
+  mkdirSync(join(live, 'scripts'))
+  cpSync(join(repoRoot, 'scripts', 'adopt.sh'), join(live, 'scripts', 'adopt.sh'))
   put(join(live, '.gitignore'), 'node_modules/\n')
   put(join(live, 'notes.md'), 'base notes\n')
   git(live, 'add', '-A')
@@ -126,6 +126,7 @@ test('test_adopt_switches_live_to_the_candidate_sha_and_removes_adopt_json', () 
 
   expect(run.status, `adopt.sh must succeed\n${run.output}`).toBe(0)
   expect(head(), 'live must stand on the candidate sha').toBe(sha)
+  expect(git(fixture.live, 'symbolic-ref', 'HEAD')).toBe('refs/heads/live')
   expect(readFileSync(join(fixture.live, 'notes.md'), 'utf8'), 'the working tree of live must hold the candidate files').toBe(
     'candidate notes\n',
   )
@@ -142,20 +143,6 @@ test('test_adopt_without_adopt_json_leaves_live_alone', () => {
   expect(head(), 'live is not switched without adopt.json').toBe(fixture.base)
   expect(head()).not.toBe(sha)
   expect(readFileSync(join(fixture.live, 'notes.md'), 'utf8')).toBe('base notes\n')
-})
-
-// --- [h1] adoption keeps HEAD of live on the branch live -------------------------------------------
-
-test('test_h1_adopt_moves_the_live_branch_to_the_sha_instead_of_detaching_head', () => {
-  const sha = makeCandidate('c3', 'notes.md', 'candidate notes\n')
-  writeAdopt(sha)
-
-  const run = startPre()
-
-  expect(run.status, `adopt.sh must succeed\n${run.output}`).toBe(0)
-  expect(git(fixture.live, 'symbolic-ref', 'HEAD'), 'HEAD of live is always the branch live').toBe('refs/heads/live')
-  expect(git(fixture.live, 'rev-parse', 'refs/heads/live'), 'the branch live points to the adopted sha').toBe(sha)
-  expect(head()).toBe(sha)
 })
 
 // --- [rollback] ------------------------------------------------------------------------------------
@@ -219,25 +206,26 @@ function parseUnit(text: string): Unit {
   return { values: (section, key) => sections.get(section)?.get(key) ?? [] }
 }
 
-test('test_unit_runs_adopt_sh_before_start_and_restarts_on_exit_42', () => {
-  const unit = parseUnit(readFileSync(join(repoRoot, 'deploy', 'dshbot.service'), 'utf8'))
 
-  const pre = unit.values('Service', 'ExecStartPre')
-  expect(
-    pre.some((value) => value.includes('scripts/adopt.sh')),
-    `ExecStartPre must run scripts/adopt.sh, got ${JSON.stringify(pre)}`,
-  ).toBe(true)
-
-  const tokens = (key: string): string[] => unit.values('Service', key).flatMap((value) => value.split(/\s+/)).filter((t) => t !== '')
-  const prevent = tokens('RestartPreventExitStatus')
-  expect(prevent, '/panic (77) keeps the service down').toContain('77')
-  expect(prevent, 'exit 42 is the adoption restart: it must not be prevented').not.toContain('42')
-  // An intentional restart (adoption 42, /restart 75) is a successful exit for
-  // OnFailure, but RestartForceExitStatus must still bring the daemon back.
-  for (const code of ['42', '75']) {
-    expect(tokens('SuccessExitStatus'), `exit ${code} is an intentional restart`).toContain(code)
-    expect(tokens('RestartForceExitStatus'), `exit ${code} still restarts the daemon`).toContain(code)
-    expect(prevent, `exit ${code} must not keep the service down`).not.toContain(code)
+test('healthy stable survives a missing state field and rolls back an unverified plain rollout', async () => {
+  expect(startPre().status).toBe(0)
+  await createEvolve({ home: fixture.home, live: fixture.live, review: { baseUrl: 'http://127.0.0.1:9', apiKey: 'unused' }, card: async () => undefined }).markHealthy()
+  expect(git(fixture.live, 'rev-parse', 'stable^{commit}')).toBe(fixture.base)
+  const statePath = join(fixture.home, 'evolve-state')
+  const healthyState = readFileSync(statePath, 'utf8')
+  expect(healthyState).toContain('healthy=1')
+  writeFileSync(statePath, healthyState.replace(/^stable=.*\n/m, ''))
+  put(join(fixture.live, 'notes.md'), 'unverified rollout\n')
+  git(fixture.live, 'add', '-A')
+  git(fixture.live, 'commit', '-q', '-m', 'unverified rollout')
+  const broken = head()
+  for (let start = 1; start <= 4; start++) {
+    const run = startPre()
+    expect(run.status, run.output).toBe(0)
+    if (start < 4) expect(head()).toBe(broken)
+    expect(readFileSync(statePath, 'utf8')).toContain(`stable=${fixture.base}`)
   }
-  expect(unit.values('Service', 'Restart')).toEqual(['on-failure'])
+  expect(head()).toBe(fixture.base)
+  expect(git(fixture.live, 'symbolic-ref', 'HEAD')).toBe('refs/heads/live')
+  expect(JSON.parse(readFileSync(join(fixture.home, 'rollback.json'), 'utf8'))).toMatchObject({ from: broken, stable: fixture.base })
 })

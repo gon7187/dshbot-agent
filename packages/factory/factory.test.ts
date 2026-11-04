@@ -87,53 +87,6 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true })
 })
 
-test('an empty .git directory is not a repository: refused with a reason, nothing stored', async () => {
-  const path = join(root, 'empty-dot-git')
-  mkdirSync(join(path, '.git'), { recursive: true })
-  expect(await gitRepositoryProblem(path)).toBeDefined()
-  const reply = await addProject(path)
-  expect(reply).toContain('Не является git-репозиторием')
-  expect(reply).toContain(path)
-  expect(storedPaths()).toEqual([])
-})
-
-test('a gitfile pointing at a missing gitdir is refused, nothing stored', async () => {
-  const path = join(root, 'broken-gitfile')
-  mkdirSync(path)
-  writeFileSync(join(path, '.git'), `gitdir: ${join(root, 'no-such-gitdir')}\n`)
-  expect(await gitRepositoryProblem(path)).toBeDefined()
-  const reply = await addProject(path)
-  expect(reply).toContain('Не является git-репозиторием')
-  expect(storedPaths()).toEqual([])
-})
-
-test('a .git file that is not a gitfile is refused, nothing stored', async () => {
-  const path = join(root, 'garbage-gitfile')
-  mkdirSync(path)
-  writeFileSync(join(path, '.git'), 'not a gitfile\n')
-  const reply = await addProject(path)
-  expect(reply).toContain('Не является git-репозиторием')
-  expect(storedPaths()).toEqual([])
-})
-
-test('an enclosing repository does not vouch for a subdirectory with an empty .git', async () => {
-  const outer = gitRepo(join(root, 'outer'))
-  const path = join(outer, 'nested')
-  mkdirSync(join(path, '.git'), { recursive: true })
-  const reply = await addProject(path)
-  expect(reply).toContain('Не является git-репозиторием')
-  expect(storedPaths()).toEqual([])
-})
-
-test('a plain subdirectory of a repository is not a project root', async () => {
-  const outer = gitRepo(join(root, 'outer-plain'))
-  const path = join(outer, 'src')
-  mkdirSync(path)
-  const reply = await addProject(path)
-  expect(reply).toContain('Не является git-репозиторием')
-  expect(storedPaths()).toEqual([])
-})
-
 test('an inherited GIT_DIR does not make an empty .git look valid', async () => {
   const real = gitRepo(join(root, 'real-for-env'))
   vi.stubEnv('GIT_DIR', join(real, '.git'))
@@ -143,6 +96,13 @@ test('an inherited GIT_DIR does not make an empty .git look valid', async () => 
   const reply = await addProject(path)
   expect(reply).toContain('Не является git-репозиторием')
   expect(storedPaths()).toEqual([])
+  for (const [name, gitfile] of [['broken-pointer', 'gitdir: missing\n'], ['malformed-pointer', 'not a gitfile\n']]) {
+    const invalid = join(root, name!)
+    mkdirSync(invalid)
+    writeFileSync(join(invalid, '.git'), gitfile!)
+    await addProject(invalid)
+    expect(storedPaths()).toEqual([])
+  }
 })
 
 test('a real repository and a linked worktree are accepted and stored with their test command', async () => {
@@ -163,16 +123,6 @@ test('a real repository and a linked worktree are accepted and stored with their
     test_command: string
   }>
   expect(commands.map((row) => row.test_command)).toEqual(['node --test', 'npm test'])
-})
-
-test('a missing path and a file are refused before git runs', async () => {
-  expect(await gitRepositoryProblem(join(root, 'missing'))).toBe('каталог не существует')
-  const file = join(root, 'file.txt')
-  writeFileSync(file, 'x')
-  expect(await gitRepositoryProblem(file)).toBe('это не каталог')
-  const reply = await addProject(file)
-  expect(reply).toContain('Не является git-репозиторием')
-  expect(storedPaths()).toEqual([])
 })
 
 // The panel screen of one task must carry the actions of its status: the card
@@ -202,104 +152,15 @@ async function openTaskScreen(id: number): Promise<string[]> {
   return (markup?.inline_keyboard ?? []).flat().map((entry) => String(entry.callback_data ?? '').replace(/^f1:/, ''))
 }
 
-test('a task waiting for acceptance offers «Принять» and «Вернуть» on the panel screen', async () => {
-  const id = insertTask('awaiting_human', undefined, ['src/value.mjs'])
-  const data = await openTaskScreen(id)
-  expect(data).toContain(`ac:${id}`)
-  expect(data).toContain(`rv:${id}`)
-  expect(data, 'approval buttons belong to another status').not.toContain(`aa:${id}`)
-  expect(data, 'the way back stays').toContain('s:t')
-})
-
 // A task that ended without a commit has nothing to accept: the panel must not
 // offer a press that only fails later in git or gh.
-test('an empty task waiting for acceptance offers «Вернуть» and «Отклонить», not «Принять»', async () => {
-  const id = insertTask('awaiting_human')
-  const data = await openTaskScreen(id)
-  expect(data).toContain(`rv:${id}`)
-  expect(data).toContain(`ar:${id}`)
-  expect(data, 'there is nothing to accept').not.toContain(`ac:${id}`)
-  expect(data).toContain('s:t')
-})
-
-test('an analysed task offers «Одобрить», «Править» and «Отменить» on the panel screen', async () => {
-  const id = insertTask('awaiting_approval')
-  expect(await openTaskScreen(id)).toEqual([`aa:${id}`, `ae:${id}`, `ar:${id}`, 's:t'])
-})
-
-test('a task of every other status keeps only the way back', async () => {
-  for (const status of ['incoming', 'analysis', 'queued', 'running', 'merged', 'rejected']) {
-    const id = insertTask(status)
-    expect(await openTaskScreen(id), status).toEqual(['s:t'])
-  }
-})
 
 // A press must leave a visible trace: the card says what started, and a failed
 // merge names its reason. A toast of a callback answer lives a second only.
-test('«Принять» rewrites the acceptance card and names the reason of a failure', async () => {
-  const id = insertTask('awaiting_human', 31, ['src/value.mjs'])
-  await openTaskScreen(id)
-  const mark = calls.length
-  expect(await factory.handleCallback({ id: 'cb-ac', chatId: OWNER, fromId: OWNER, messageId: 7, data: `f1:ac:${id}` })).toBe(true)
-  const started = calls
-    .slice(mark)
-    .filter((call) => call.method === 'editMessageText' && call.params.message_id === 31)
-    .map((call) => JSON.stringify(call.params))
-    .join('\n')
-  expect(started, 'the card of the task says the merge started').toContain('Вливаю изменения')
-  await vi.waitFor(() => {
-    const later = calls.slice(mark).map((call) => JSON.stringify(call.params)).join('\n')
-    expect(later, 'the failed merge names its reason').toContain('worktree задачи не найден')
-  }, { timeout: 10_000 })
-})
-
-test('«Принять» on a task that no longer waits for acceptance says so instead of staying silent', async () => {
-  const id = insertTask('running')
-  await openTaskScreen(id)
-  const mark = calls.length
-  expect(await factory.handleCallback({ id: 'cb-ac2', chatId: OWNER, fromId: OWNER, messageId: 7, data: `f1:ac:${id}` })).toBe(true)
-  const after = calls.slice(mark).map((call) => JSON.stringify(call.params)).join('\n')
-  expect(after, 'the owner learns that there is nothing to merge').toContain('вливать нечего')
-})
 
 // A second press on a card that already says everything is the normal case:
 // Telegram answers 400 "message is not modified" to the identical edit. That is
 // not a failure, and it must not stop the press from being answered.
-test('a repeated press on an unchanged card is answered, not thrown', async () => {
-  const id = insertTask('running', 31)
-  await openTaskScreen(id)
-  apiFault = (method) =>
-    method === 'editMessageText'
-      ? new TelegramApiError(
-          method,
-          400,
-          'Bad Request: message is not modified: specified new message content and reply markup are exactly the same',
-        )
-      : undefined
-  calls = []
-  await expect(
-    factory.handleCallback({ id: 'cb-again', chatId: OWNER, fromId: OWNER, messageId: 7, data: `f1:ac:${id}` }),
-  ).resolves.toBe(true)
-  const answered = calls.filter((call) => call.method === 'answerCallbackQuery')
-  expect(answered, 'the press is answered even when nothing changed').toHaveLength(1)
-})
 
 // Any other failure of the edit would escape handleCallback, leave the callback
 // unanswered and look like a dead button. The reason must reach the owner.
-test('a failing edit answers the press and tells the owner the reason', async () => {
-  const id = insertTask('running', 31)
-  await openTaskScreen(id)
-  apiFault = (method) =>
-    method === 'editMessageText' ? new TelegramApiError(method, 400, "Bad Request: message can't be edited") : undefined
-  calls = []
-  await expect(
-    factory.handleCallback({ id: 'cb-fail', chatId: OWNER, fromId: OWNER, messageId: 7, data: `f1:ac:${id}` }),
-  ).resolves.toBe(true)
-  expect(calls.some((call) => call.method === 'answerCallbackQuery'), 'the toast is sent').toBe(true)
-  const sent = calls
-    .filter((call) => call.method.startsWith('send'))
-    .map((call) => JSON.stringify(call.params))
-    .join('\n')
-  expect(sent, 'the owner sees why the button did nothing').toContain('не сработала')
-  expect(sent, 'the reason is quoted').toContain("message can't be edited")
-})

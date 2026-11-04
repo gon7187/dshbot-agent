@@ -21,20 +21,6 @@ function event(usage: TokenUsage): string {
   return JSON.stringify({ type: 'assistant/message', data: { usage } }) + '\n'
 }
 
-test('goal spend and display use guard pricing and exceed the USD cap for an expensive response', () => {
-  const file = logFile()
-  const usage: TokenUsage = { inputTokens: 12, outputTokens: 10_000, cacheReadTokens: 0, cacheWriteTokens: 0 }
-  writeFileSync(file, event(usage))
-  const measured = createUsageMeter(file).readSince(0)
-  expect(measured.usd).toBe(costOf(JUDGE_MODEL, usage))
-  expect(measured.usd).toBeCloseTo(0.0120036, 12)
-  expect(measured.usd).toBeGreaterThan(0.01)
-  expect(formatGoal({
-    token: 'priced', condition: 'finish', turns: 1, spendUsd: measured.usd,
-    usageOffset: measured.offset, startedAt: 0,
-  })).toContain('Расход: $0.0120')
-})
-
 test('cached usage keeps guard rates across incremental reads without counting prior events twice', () => {
   const file = logFile()
   const first: TokenUsage = { inputTokens: 25, cacheReadTokens: 100_000, cacheWriteTokens: 500, outputTokens: 20 }
@@ -50,4 +36,8 @@ test('cached usage keeps guard rates across incremental reads without counting p
   expect(next.outputTokens).toBe(second.outputTokens)
   expect(meter.readSince(next.offset).usd).toBe(0)
   expect(meter.readSince(0).usd).toBeCloseTo(initial.usd + next.usd, 12)
+  const expensive = { inputTokens: 12, outputTokens: 10_000, cacheReadTokens: 0, cacheWriteTokens: 0 }
+  appendFileSync(file, event(expensive))
+  expect(meter.readSince(next.offset).usd).toBeGreaterThan(0.01)
+  expect(meter.readSince(next.offset).usd).toBe(costOf(JUDGE_MODEL, expensive))
 })

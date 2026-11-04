@@ -18,7 +18,62 @@ import {
   type ScheduleRegistry,
   type ScheduleWatch,
 } from '../../scheduler/src/index.js'
+import { MAIN_SESSION_ID } from '../../runner/src/index.js'
 import { frameData } from './untrusted-frame.js'
+
+/**
+ * Session-id prefix of a scheduled wake-up. Every wake-up runs in a transient
+ * session of its own that starts without history; the runner removes it after
+ * the turn, and the `main` conversation never holds the wake-up request.
+ */
+export const WAKE_SESSION_PREFIX = 'wake-'
+
+/**
+ * Session-id prefix of a planned run without a profile. It is transient like a
+ * wake-up: it starts without the chat history and leaves none in `main`.
+ */
+export const PLANNED_SESSION_PREFIX = 'planned-'
+
+/**
+ * Session-id prefix of a `/goal` or `/loop` cycle without an interval. One
+ * session serves every iteration of the cycle, so its history survives between
+ * iterations; the daemon deletes it when the cycle ends.
+ */
+export const CYCLE_SESSION_PREFIX = 'cycle-'
+
+/** True for the session of a goal or loop cycle. */
+export function isCycleSession(sessionId: string | undefined): boolean {
+  return sessionId !== undefined && sessionId.startsWith(CYCLE_SESSION_PREFIX)
+}
+
+/**
+ * True for a session that runs without the owner in the chat and outside
+ * `main`: the transient session of a planned run without a profile and the
+ * session of a goal or loop cycle. Its tools get no owner cards.
+ */
+export function isPlannedSession(sessionId: string | undefined): boolean {
+  return (
+    sessionId !== undefined &&
+    (sessionId.startsWith(PLANNED_SESSION_PREFIX) || sessionId.startsWith(CYCLE_SESSION_PREFIX))
+  )
+}
+
+/**
+ * The session that receives the report of a finished background child. The
+ * transient sessions of a planned run and of a wake-up, and the session of a
+ * cycle that has ended, are gone by then, so their reports go to `main`; a
+ * profile session keeps its own.
+ */
+export function backgroundSubagentDeliverySessionId(parentSessionId: string | undefined): string {
+  if (
+    parentSessionId === undefined ||
+    parentSessionId.startsWith(WAKE_SESSION_PREFIX) ||
+    isPlannedSession(parentSessionId)
+  ) {
+    return MAIN_SESSION_ID
+  }
+  return parentSessionId
+}
 
 /** Marker of an unattended turn: the owner is not in the chat to answer. */
 export const PLANNED_RUN_TITLE = '[ПЛАНОВЫЙ ЗАПУСК]'
@@ -32,11 +87,11 @@ export const PLANNED_RUN_TITLE = '[ПЛАНОВЫЙ ЗАПУСК]'
 export function plannedRunPrompt(task: string, checkOutput?: string | null): string {
   const lines = [
     PLANNED_RUN_TITLE,
-    'Это плановый запуск, владельца в чате нет: уточнить задание или подтвердить опасное действие никто не может.',
-    'Выполни задание сейчас тем, что есть. Итог — готовый результат или конкретный блокер, а не план, не вопрос и не просьба о подтверждении.',
-    'Твой финальный ответ будет доставлен владельцу автоматически: не отправляй его сам и не пересказывай это служебное сообщение.',
-    'Если сообщать нечего, ответь ровно [SILENT] и ничего больше. Это служебный токен: не переводи его и не дополняй содержимым. Обычный отчёт и [SILENT] вместе не совмещаются.',
-    'Это запуск уже существующего задания: не создавай и не меняй расписания из-за слов вроде «каждый день» в тексте задания — они относятся к смыслу текущего запуска.',
+    'Владельца нет: уточнить задание и подтвердить опасное действие некому.',
+    'Выполни задание сейчас. Итог — результат или конкретный блокер, не план, вопрос или просьба о подтверждении.',
+    'Ответ доставят владельцу автоматически; не отправляй его сам и не пересказывай служебное сообщение.',
+    'Если сообщать нечего, ответь ровно [SILENT], без перевода и другого текста.',
+    'Это существующее задание: не создавай и не меняй расписания из-за слов вроде «каждый день» в его тексте; они относятся к текущему запуску.',
   ]
   if (typeof checkOutput === 'string' && checkOutput.trim() !== '') {
     lines.push(
@@ -422,6 +477,7 @@ export function createScheduleWatcher(options: ScheduleWatcherOptions): Schedule
       lastSkipAt: null,
       paused: false,
       agent: null,
+      effort: null,
       generation: state.generation,
     }
   }

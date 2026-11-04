@@ -41,6 +41,7 @@ import type { TelegramApi } from '../../telegram/src/api.js'
 import { TelegramApiError } from '../../telegram/src/api.js'
 import { markdownToHtml, markdownToPlain } from '../../telegram/src/rich/html.js'
 import { sendFormatted } from '../../telegram/src/rich/send.js'
+import { createEngineeringGitView, engineeringHiddenPaths, isEngineeringPrivatePath, isSafeEngineeringNpmrc } from './engineering.js'
 
 /** Callback prefix of every button of the embedded factory menu. */
 const CALLBACK_PREFIX = 'f1'
@@ -250,6 +251,12 @@ export interface FactoryRoleTurn {
 /** Runs one execution-role turn and returns the model's final text. */
 export type FactoryRoleRunner = (turn: FactoryRoleTurn) => Promise<string>
 
+export interface FactoryCommandRuntime {
+  tools: readonly RunnerTool[]
+  run(command: string): Promise<{ ok: boolean; output: string }>
+  stop(): Promise<void>
+}
+
 export interface FactoryOptions {
   store: FactoryStore
   /** `DSHBOT_HOME`; the bot's own repository defaults to `<home>/app`. */
@@ -271,6 +278,14 @@ export interface FactoryOptions {
   analysis?: FactoryAnalysisRunner
   /** Runs one test-writer, executor or reviewer turn through the harness. */
   roleTurn?: FactoryRoleRunner
+  /** A confined candidate shell; never supplied to the read-only reviewer. */
+  commandRuntime?: (request: {
+    taskId: number
+    role: 'test_writer' | 'executor'
+    worktree: string
+    projectPath: string
+    prepareDependencies?: boolean
+  }) => Promise<FactoryCommandRuntime>
   /** Connectable provider routes, in the order the provider screen shows them. */
   providers?: () => Promise<readonly FactoryProviderInfo[]>
   /**
@@ -284,6 +299,8 @@ export interface FactoryOptions {
   ) => Promise<FactoryProviderStatus>
   /** Remove the stored sign-in of one provider route. */
   disconnectProvider?: (id: string) => Promise<void>
+  /** Queue adoption after a verified GitHub merge of the bot itself. */
+  onOwnMerged?: (event: { taskId: number }) => void | Promise<void>
   /** HOME of the daemon, an empty tmpfs inside the gate sandbox. */
   ownerHome?: string
   /** Test seam for the sandboxed project tests; the real bwrap gate by default. */
@@ -299,6 +316,8 @@ export interface FactoryTaskInput {
   title?: string
   /** Connected project name; absent means the bot's own repository. */
   project?: string
+  /** Durable replay key, 1–256 characters and not whitespace-only. */
+  requestId?: string
 }
 
 export interface Factory {
@@ -404,11 +423,16 @@ const FACTORY_STEPS: readonly string[] = [
   // The commit the task worktree started from, so a resumed execution diffs
   // and gates against the same base as the interrupted one.
   `ALTER TABLE factory_tasks ADD COLUMN worktree_base TEXT`,
+  `CREATE TABLE factory_task_requests (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    task_id INTEGER NOT NULL UNIQUE REFERENCES factory_tasks(id)
+  )`,
 ]
 
 const execFileAsync = promisify(execFile)
 const GIT_TIMEOUT_MS = 10_000
 const AUTOACCEPT_KV_KEY = 'factory.autoaccept'
+const AUTOPILOT_KV_KEY = 'factory.autopilot'
 const TASK_TITLE_LIMIT = 80
 const ROLE_MODELS_KV_PREFIX = 'factory.role_models.'
 const ROLE_EFFORT_KV_PREFIX = 'factory.role_effort.'
@@ -688,10 +712,7 @@ function pathSegments(path: string): string[] {
  * same tree may be checked out on a case-insensitive filesystem.
  */
 function isForbiddenAnalysisPath(path: string): boolean {
-  return pathSegments(path).some((segment) => {
-    const lower = segment.toLowerCase()
-    return lower === '.git' || lower.startsWith('.env') || lower.includes('secret')
-  })
+  return isEngineeringPrivatePath(path) || pathSegments(path).some((segment) => segment.toLowerCase().includes('secret'))
 }
 
 /** `git ls-files -z` of the project with extra arguments; empty when git fails. */
@@ -1004,19 +1025,11 @@ export function assessFactoryRisk(input: FactoryRiskInput): { risk: FactoryRisk;
 /** The JSON contract of the analysis role. */
 function analysisSystemPrefix(task: { title: string; body: string; project_name: string; project_path: string }, tree: readonly string[]): string {
   return [
-    'Ты — роль «разбор» завода бота.',
-    'Прочитай текст задачи и код проекта (только чтение) и верни разбор.',
-    'Ответь только JSON без пояснений:',
+    'Ты — роль «разбор» завода бота. Прочитай задачу и код (только чтение), верни только JSON:',
     '{"criteria":["..."],"footprint":["..."],"risk":"low"}',
-    'Правила:',
-    '- критерий — одно наблюдаемое поведение на критерий (каждый критерий проверяем отдельно);',
-    '- footprint — пути проекта, которые разрешено менять;',
-    '- risk — строго low или high;',
-    '- high ставь, если задача трогает деньги, авторизацию, секреты, удаление данных или миграции,',
-    '  либо если footprint задевает migrations/, .github/workflows/, .env* или пути с secret/secrets',
-    '  (в том числе каталогом, который их содержит, или корнем проекта);',
-    '- чтобы прочитать файл, вызови инструмент read_file с путём относительно корня проекта;',
-    '- файлы .env*, пути с secret/secrets и всё вне корня проекта читать нельзя.',
+    'Критерий — одно проверяемое поведение; footprint — разрешённые пути; risk — строго low или high.',
+    'high: деньги, авторизация, секреты, удаление данных, миграции или footprint, задевающий migrations/, .github/workflows/, .env*, пути с secret/secrets, включая содержащий их каталог или корень проекта.',
+    'read_file принимает путь от корня проекта; .env*, пути с secret/secrets и всё вне корня читать нельзя.',
     '',
     `Проект: ${task.project_name}`,
     `Корень проекта: ${task.project_path}`,
@@ -1301,34 +1314,31 @@ function roleSystemPrefix(
     'Критерии приёмки:',
     ...task.criteria.map((criterion) => `- ${criterion}`),
     '',
-    'Footprint задачи (разрешённые пути):',
+    'Footprint (разрешённые пути):',
     ...task.footprint.map((path) => `- ${path}`),
     '',
-    'Ты работаешь в отдельной рабочей копии задачи. Инструменты чтения и записи',
-    'принимают пути относительно её корня; всё вне копии, .env* и пути с secret/secrets запрещены.',
+    'Пути от корня отдельной копии; вне её, .env* и пути с secret/secrets запрещены.',
   ]
   if (role === 'test_writer') {
     lines.push(
       '',
-      'Напиши красные тесты по критериям: они должны падать на текущем коде и проходить',
-      'после правильной реализации. Меняй только тестовые файлы; продовый код не трогай.',
-      'В конце верни только JSON без пояснений:',
+      'Напиши тесты по критериям: падают сейчас, проходят после реализации. Меняй только тесты, не продовый код.',
+      'Только JSON:',
       '{"tests":["путь/к/тесту"],"summary":"что покрыто"}',
     )
   } else if (role === 'executor') {
     lines.push(
       '',
-      'Измени только файлы внутри footprint и не меняй тесты тестописца.',
-      'В конце верни только JSON без пояснений:',
+      'Меняй лишь footprint, не тесты тестописца.',
+      'Только JSON:',
       '{"summary":"что изменено","files":["путь"]}',
     )
   } else {
     lines.push(
       '',
-      'Проверь изменённые файлы против критериев приёмки. Тесты и код уже написаны;',
-      'тебе доступно только чтение. Верни только JSON без пояснений:',
+      'Код и тесты готовы. Проверь изменения по критериям, только чтение; ответ — JSON:',
       '{"verdict":"approve","approved":true,"summary":"итог","issues":[],"comments":[]}',
-      'Если есть замечания, верни verdict "reject", approved false и перечисли их в issues.',
+      'При замечаниях verdict "reject", approved false, опиши их в issues.',
     )
   }
   return lines.join('\n')
@@ -1370,7 +1380,7 @@ function looksLikeTestFile(path: string): boolean {
 }
 
 /** Paths declared by the writer, plus any test file its turn changed. */
-function writerTestPaths(text: string, changed: readonly string[]): string[] {
+function writerTestPaths(text: string, changed: readonly string[], worktree: string): string[] {
   const parsed = extractJson(text)
   const declared: string[] = []
   if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -1383,7 +1393,10 @@ function writerTestPaths(text: string, changed: readonly string[]): string[] {
   }
   const paths = new Set(declared)
   for (const path of changed) if (looksLikeTestFile(path)) paths.add(path)
-  return [...paths]
+  return [...paths].flatMap((path) => {
+    const target = resolveRoleTarget(worktree, path)
+    return 'error' in target ? [] : [target.relative.replace(/^\/+/, '')]
+  })
 }
 
 /** Whether a changed path is covered by one footprint entry. */
@@ -1803,6 +1816,12 @@ export function createFactory(options: FactoryOptions): Factory {
     `INSERT INTO factory_tasks (title, body, status, project_id, project_name, project_path, created_at)
      VALUES (?, ?, 'incoming', ?, ?, ?, ?)`,
   )
+  const findTaskRequestStatement = store.db.prepare(
+    'SELECT task_id FROM factory_task_requests WHERE request_id = ?',
+  )
+  const insertTaskRequestStatement = store.db.prepare(
+    'INSERT INTO factory_task_requests (request_id, task_id) VALUES (?, ?)',
+  )
   const markAnalysisStatement = store.db.prepare(
     `UPDATE factory_tasks SET status = 'analysis', remark = ?, analysis_running = 1 WHERE id = ?`,
   )
@@ -1909,7 +1928,7 @@ export function createFactory(options: FactoryOptions): Factory {
   const executorProviders = new Map<number, string>()
   /** Acceptance/merge queue: one task at a time, like execution. */
   const acceptanceQueue: number[] = []
-  let acceptanceRunning = false
+  let acceptanceDrain: Promise<void> | undefined
   /**
    * Identifies this daemon generation. Role session ids include it so a task
    * resumed after a restart never reopens the interrupted run's history.
@@ -1922,6 +1941,28 @@ export function createFactory(options: FactoryOptions): Factory {
 
   function log(message: string): void {
     options.log?.(`factory: ${message}`)
+  }
+
+  function withRoleSkill(prefix: string, role: FactoryRole): string {
+    const path = join(home, 'factory', 'role-skills', role, 'SKILL.md')
+    const invalid = () => new Error(`Приватный профиль роли «${role}» должен быть обычным UTF-8 файлом внутри role-skills, от 1 до 8192 байт`)
+    let stat
+    try {
+      stat = lstatSync(path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return prefix
+      throw invalid()
+    }
+    if (!stat.isFile() || stat.size === 0 || stat.size > 8192 ||
+      realpathSync(path) !== join(realpathSync(home), 'factory', 'role-skills', role, 'SKILL.md')) throw invalid()
+    let skill: string
+    try {
+      const bytes = readFileSync(path)
+      if (bytes.length > 8192) throw invalid()
+      skill = new TextDecoder('utf-8', { fatal: true }).decode(bytes).trim()
+    } catch { throw invalid() }
+    if (skill === '') throw invalid()
+    return `${prefix}\n\nПриватный навык роли «${role}»:\n${skill}`
   }
 
   function projectOf(row: ProjectRow): FactoryProject {
@@ -1981,6 +2022,21 @@ export function createFactory(options: FactoryOptions): Factory {
 
   function autoacceptEnabled(): boolean {
     return store.kv.get(AUTOACCEPT_KV_KEY) !== '0'
+  }
+
+  function autopilotEnabled(): boolean {
+    return store.kv.get(AUTOPILOT_KV_KEY) === '1'
+  }
+
+  function autoapprove(row: TaskRow): boolean {
+    const externalAction = /(?:выкат(?:и|ывай)|задеплой|перезапусти|\b(?:deploy|publish|systemctl|ssh|git\s+push|scp|rsync)\b)/i.test(row.body)
+    const containedOwnWork = row.project_id === ownProject.id && options.commandRuntime !== undefined
+    if (!autopilotEnabled() || options.ownerId() === null || row.status !== 'awaiting_approval' ||
+      riskOf(row.risk) === undefined || externalAction || (row.risk !== 'low' && !containedOwnWork) ||
+      listOf(row.criteria).length === 0 || listOf(row.footprint).length === 0) return false
+    approveStatement.run(Date.now(), row.id)
+    enqueueExecution(row.id)
+    return true
   }
 
   async function catalogue(): Promise<FactoryModel[]> {
@@ -2204,11 +2260,13 @@ export function createFactory(options: FactoryOptions): Factory {
         '',
         `В работе: ${counts.running} · ждут владельца: ${counts.waitingOwner}`,
         `Автоприёмка: ${autoacceptEnabled() ? 'включена' : 'выключена'}`,
+        `Автопилот: ${autopilotEnabled() ? 'включён' : 'выключен'}`,
       ].join('\n'),
       keyboard: [
         [button('Задачи', 's:t'), button('Новая задача', 's:n', 'success')],
         [button('Проекты', 's:p'), button('Модели', 's:m')],
         [button('Провайдеры', 's:v'), button('Автоприёмка', 's:a')],
+        [button('Автопилот', 's:u')],
       ],
     }
   }
@@ -2446,6 +2504,23 @@ export function createFactory(options: FactoryOptions): Factory {
     }
   }
 
+  function autopilotScreen(): Screen {
+    const enabled = autopilotEnabled()
+    return {
+      markdown: [
+        '**Автопилот**',
+        `Автопилот: ${enabled ? 'включён' : 'выключен'}`,
+        'Низкий риск: разбор → автоматическое одобрение → исполнение → зелёный гейт → независимое ревью → вливание.',
+        'Автоприёмка для этого режима не требуется. Высокий риск своего бота готовится в изолированной копии, вливание решает владелец. Внешние действия, деплой и ошибки остаются владельцу.',
+        'После включения продолжаются и уже разобранные задачи низкого риска; после рестарта — также готовые проверенные результаты.',
+      ].join('\n'),
+      keyboard: [
+        [button(enabled ? 'Выключить автопилот' : 'Включить автопилот', 'ap')],
+        [button('Назад', 'h')],
+      ],
+    }
+  }
+
   /** Send the home screen as one new message with the ordinary rich → HTML → plain ladder. */
   async function sendHome(chatId: number, threadId?: number): Promise<void> {
     const screen = homeScreen()
@@ -2637,10 +2712,10 @@ export function createFactory(options: FactoryOptions): Factory {
     const reasoningEffort = await roleTurnEffort('analysis', model)
 
     const tree = await trackedProjectFiles(task.projectPath)
-    const systemPrefix = analysisSystemPrefix(
+    const systemPrefix = withRoleSkill(analysisSystemPrefix(
       { title: task.title, body: task.body, project_name: task.projectName, project_path: task.projectPath },
       tree,
-    )
+    ), 'analysis')
     const tools = [analysisReadTool(task.projectPath)]
     let retryNote: string | undefined
     let parsed: ParsedAnalysis | undefined
@@ -2692,7 +2767,7 @@ export function createFactory(options: FactoryOptions): Factory {
       job.taskId,
     )
     const saved = findTaskStatement.get(job.taskId) as TaskRow | undefined
-    if (saved !== undefined) await sendAnalysisCard(job, saved)
+    if (saved !== undefined && !autoapprove(saved)) await sendAnalysisCard(job, saved)
   }
 
   // -------------------------------------------------------------------------
@@ -2747,7 +2822,9 @@ export function createFactory(options: FactoryOptions): Factory {
     const stats = statsOf(row.result_stats)
     const added = stats.reduce((sum, entry) => sum + entry.added, 0)
     const removed = stats.reduce((sum, entry) => sum + entry.removed, 0)
-    const lines = [`**Приёмка задачи #${task.id}: ${task.title}**`, '']
+    const lines = [hasResult(row)
+      ? `**Приёмка задачи #${task.id}: ${task.title}**`
+      : `**Задача #${task.id} остановлена: ${task.title}**`, '']
     if (stats.length > 0) {
       lines.push(
         '| Файл | Добавлено | Удалено |',
@@ -2759,7 +2836,7 @@ export function createFactory(options: FactoryOptions): Factory {
     } else if (hasResult(row)) {
       lines.push('Изменения готовы к приёмке.')
     } else {
-      lines.push('Задача закончилась без изменений относительно базы: принимать нечего. Верните её с замечанием или отклоните.')
+      lines.push('Проверенный результат не подготовлен: принимать нечего. Верните задачу с замечанием или отклоните.')
     }
     if (task.risk !== undefined) lines.push('', `**Риск:** ${task.risk}`)
     if (note !== undefined && note.trim() !== '') lines.push('', `**Причина:** ${note.trim()}`)
@@ -2811,7 +2888,11 @@ export function createFactory(options: FactoryOptions): Factory {
     const task = taskOf(row)
     const files = task.changedFiles.length
     const ownNote = project.own || realOrResolved(project.path) === realOrResolved(ownProject.path)
-      ? '\nИзменения придут в работающего бота через /update.'
+      ? where.startsWith('PR ')
+        ? options.onOwnMerged === undefined
+          ? '\nИзменения придут в работающего бота через /update.'
+          : '\nПроверю main и применю обновление автоматически после гейтов.'
+        : '\nВлито только в локальную основную ветку. Автообновление из remote недоступно: изменения ещё не опубликованы.'
       : ''
     const markdown = [
       `**Задача #${task.id} «${task.title}»: влито**`,
@@ -2837,7 +2918,11 @@ export function createFactory(options: FactoryOptions): Factory {
     if (chatId === null) return
     const task = taskOf(row)
     const ownNote = project.own || realOrResolved(project.path) === realOrResolved(ownProject.path)
-      ? '\nИзменения придут в работающего бота через /update.'
+      ? where.startsWith('PR ')
+        ? options.onOwnMerged === undefined
+          ? '\nИзменения придут в работающего бота через /update.'
+          : '\nПроверю main и применю обновление автоматически после гейтов.'
+        : '\nВлито только в локальную основную ветку. Автообновление из remote недоступно: изменения ещё не опубликованы.'
       : ''
     const markdown = [
       `Задача #${task.id} «${task.title}» влито.`,
@@ -2983,10 +3068,8 @@ export function createFactory(options: FactoryOptions): Factory {
   }
 
   /**
-   * Move the task commits onto the base branch and fast-forward the owner's
-   * copy. A base branch that exists only on the remote (origin/HEAD points at
-   * origin/release, no local release) is rebased onto the tracking branch and
-   * created locally at the rebased tip.
+   * Fast-forward only the exact base the task passed its gate on. An advanced
+   * base needs a new execution, never an untested rebase during acceptance.
    */
   async function mergeLocally(
     project: FactoryProject,
@@ -2994,52 +3077,39 @@ export function createFactory(options: FactoryOptions): Factory {
     branch: string,
     base: string,
     copy: string | undefined,
+    checkedBase: string | null,
   ): Promise<string> {
-    let upstream = base
     const local = (await tryGit(project.path, ['rev-parse', '--verify', '--quiet', `refs/heads/${base}`]))?.trim()
-    let onto = local
-    if (local === undefined) {
-      const tracking = (await tryGit(project.path, ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${base}`]))?.trim()
-      if (tracking !== undefined) {
-        upstream = `origin/${base}`
-        onto = tracking
-      } else {
-        // Installs without a fetch refspec keep no remote-tracking refs at all.
-        await gitOutput(project.path, ['fetch', '--quiet', 'origin', base], 60_000)
-        onto = (await gitOutput(project.path, ['rev-parse', 'FETCH_HEAD'])).trim()
-        upstream = onto
-      }
+    let tip = local
+    if (tip === undefined) {
+      await gitOutput(project.path, ['fetch', '--quiet', 'origin', base], 60_000)
+      tip = (await gitOutput(project.path, ['rev-parse', 'FETCH_HEAD'])).trim()
     }
-    try {
-      await gitOutput(worktree, ['rebase', onto ?? upstream], 60_000)
-    } catch (error) {
-      const conflicts = ((await tryGit(worktree, ['diff', '--name-only', '--diff-filter=U'])) ?? '')
-        .split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== '')
-      await tryGit(worktree, ['rebase', '--abort'], 60_000)
-      const detail = conflicts.length > 0 ? conflicts.join(', ') : (error instanceof Error ? error.message : String(error))
-      throw new Error(`rebase на ${upstream} дал конфликт: ${detail}`)
+    if (tip !== checkedBase) {
+      throw new Error('основная ветка изменилась после проверки задачи; создайте новую задачу на актуальной базе')
     }
     const sha = (await gitOutput(worktree, ['rev-parse', 'HEAD'])).trim()
     // A checked-out base moves only together with its files and index.
     if (copy !== undefined) {
       await gitOutput(copy, ['merge', '--ff-only', '--no-edit', branch], 60_000)
     } else {
-      // Compare-and-swap against the rebased-on tip: a base the owner moved
+      // Compare-and-swap against the checked base tip: a base the owner moved
       // meanwhile (or created, when it was remote-only) is never overwritten.
       await gitOutput(project.path, ['update-ref', `refs/heads/${base}`, sha, local ?? ''])
     }
     return `локально в ${base}`
   }
 
-  /** Push the task branch, reuse or create its PR, and rebase-merge it. */
+  /** Publish the checked task and verify GitHub actually merged that exact head. */
   async function mergeThroughGithub(
     row: TaskRow,
     worktree: string,
     branch: string,
     base: string,
   ): Promise<string> {
+    const expectedHead = (await gitOutput(worktree, ['rev-parse', 'HEAD'])).trim()
     await gitOutput(worktree, ['push', 'origin', `${branch}:${branch}`], 60_000)
-    let pullRequests: Array<{ url?: unknown; number?: unknown; state?: unknown; headRefName?: unknown }> = []
+    let pullRequests: Array<{ url?: unknown; number?: unknown; state?: unknown; headRefName?: unknown; baseRefName?: unknown }> = []
     try {
       const raw = await ghOutput(worktree, [
         'pr', 'list', '--head', branch, '--state', 'all',
@@ -3053,10 +3123,12 @@ export function createFactory(options: FactoryOptions): Factory {
     }
     const mine = pullRequests.filter((entry) => entry.headRefName === branch && typeof entry.url === 'string')
     const existing = mine.find((entry) => String(entry.state).toUpperCase() === 'OPEN') ?? mine[0]
+    if (existing !== undefined && existing.baseRefName !== base) {
+      throw new Error('существующий PR направлен в другую основную ветку; нужна проверка владельца')
+    }
     let url: string
     if (existing !== undefined) {
       url = String(existing.url)
-      if (String(existing.state).toUpperCase() === 'MERGED') return url
     } else {
       const title = `factory: задача #${row.id} — ${row.title}`.slice(0, 200)
       const output = await ghOutput(worktree, [
@@ -3066,7 +3138,28 @@ export function createFactory(options: FactoryOptions): Factory {
       url = output.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== '').at(-1) ?? ''
       if (url === '') throw new Error('gh pr create: не вернул ссылку на PR')
     }
-    await ghOutput(worktree, ['pr', 'merge', url, '--rebase'])
+    if (String(existing?.state).toUpperCase() !== 'MERGED') {
+      const remoteBase = (await gitOutput(worktree, ['ls-remote', 'origin', `refs/heads/${base}`], 60_000))
+        .trim().split(/\s+/)[0]
+      if (remoteBase !== row.result_base) {
+        throw new Error('удалённая основная ветка изменилась после проверки задачи; создайте новую задачу на актуальной базе')
+      }
+      const policy = JSON.parse(await ghOutput(worktree, [
+        'repo', 'view', '--json', 'mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed',
+      ])) as Record<string, unknown>
+      const method = policy.mergeCommitAllowed === true ? '--merge'
+        : policy.squashMergeAllowed === true ? '--squash'
+          : policy.rebaseMergeAllowed === true ? '--rebase' : undefined
+      if (method === undefined) throw new Error('GitHub не разрешает ни один метод слияния репозитория')
+      await ghOutput(worktree, ['pr', 'merge', url, method, '--match-head-commit', expectedHead])
+    }
+    const receipt = JSON.parse(await ghOutput(worktree, [
+      'pr', 'view', url, '--json', 'state,mergedAt,headRefOid,baseRefName',
+    ])) as Record<string, unknown>
+    if (receipt.state !== 'MERGED' || typeof receipt.mergedAt !== 'string' || receipt.mergedAt === '' ||
+      receipt.headRefOid !== expectedHead || receipt.baseRefName !== base) {
+      throw new Error('GitHub не подтвердил вливание проверенного коммита задачи; PR и worktree сохранены')
+    }
     return `PR ${url}`
   }
 
@@ -3147,15 +3240,30 @@ export function createFactory(options: FactoryOptions): Factory {
     }
     const where = github
       ? await mergeThroughGithub(row, worktree, branch, base)
-      : await mergeLocally(project, worktree, branch, base, botCopy ? undefined : copy)
-    await removeTaskWorktrees(project.path, taskId, worktree)
-    await removeTaskBranch(project.path, taskId)
+      : await mergeLocally(project, worktree, branch, base, botCopy ? undefined : copy, row.result_base)
+    markMergedStatement.run(taskId)
+    try {
+      await removeTaskWorktrees(project.path, taskId, worktree)
+      await removeTaskBranch(project.path, taskId)
+    } catch (error) {
+      log(`merged task cleanup failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
     const mergedRow = findTaskStatement.get(taskId) as TaskRow | undefined
     if (mergedRow !== undefined) {
-      if (mergedRow.acceptance_message_id !== null) await finishAcceptanceCard(mergedRow, project, where)
-      else await sendMergeSummary(mergedRow, project, where)
+      try {
+        if (mergedRow.acceptance_message_id !== null) await finishAcceptanceCard(mergedRow, project, where)
+        else await sendMergeSummary(mergedRow, project, where)
+      } catch (error) {
+        log(`merge notice failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
-    markMergedStatement.run(taskId)
+    if (own && github) {
+      try {
+        await options.onOwnMerged?.({ taskId })
+      } catch (error) {
+        log(`own merge adoption queue failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
   }
 
   function failAcceptance(taskId: number, error: unknown): void {
@@ -3172,26 +3280,28 @@ export function createFactory(options: FactoryOptions): Factory {
     log(`acceptance of task #${taskId} failed: ${reason}`)
   }
 
-  function enqueueAcceptance(taskId: number): void {
+  function enqueueAcceptance(taskId: number): Promise<void> {
     if (!acceptanceQueue.includes(taskId)) acceptanceQueue.push(taskId)
-    void drainAcceptance()
+    return drainAcceptance()
   }
 
-  async function drainAcceptance(): Promise<void> {
-    if (acceptanceRunning) return
-    acceptanceRunning = true
-    try {
-      while (acceptanceQueue.length > 0) {
-        const taskId = acceptanceQueue.shift()!
-        try {
-          await performAcceptance(taskId)
-        } catch (error) {
-          failAcceptance(taskId, error)
+  function drainAcceptance(): Promise<void> {
+    if (acceptanceDrain !== undefined) return acceptanceDrain
+    acceptanceDrain = (async () => {
+      try {
+        while (acceptanceQueue.length > 0) {
+          const taskId = acceptanceQueue.shift()!
+          try {
+            await performAcceptance(taskId)
+          } catch (error) {
+            failAcceptance(taskId, error)
+          }
         }
+      } finally {
+        acceptanceDrain = undefined
       }
-    } finally {
-      acceptanceRunning = false
-    }
+    })()
+    return acceptanceDrain
   }
 
   /** Drop every task binding of one message: it now shows another screen. */
@@ -3233,7 +3343,14 @@ export function createFactory(options: FactoryOptions): Factory {
   }
 
   async function createWorktree(projectPath: string, taskId: number, path: string): Promise<void> {
-    await gitOutput(projectPath, ['worktree', 'add', '-q', '-B', `factory/${taskId}`, path, 'HEAD'], 60_000)
+    const base = await baseBranchOf(projectPath)
+    const remote = (await tryGit(projectPath, ['config', '--get', 'remote.origin.url']))?.trim()
+    let start = base
+    if (remote !== undefined && remote !== '') {
+      await gitOutput(projectPath, ['fetch', '--quiet', 'origin', base], 60_000)
+      start = (await gitOutput(projectPath, ['rev-parse', 'FETCH_HEAD'])).trim()
+    }
+    await gitOutput(projectPath, ['worktree', 'add', '-q', '-B', `factory/${taskId}`, path, start], 60_000)
   }
 
   /**
@@ -3265,6 +3382,7 @@ export function createFactory(options: FactoryOptions): Factory {
     }
     try {
       rmSync(path, { recursive: true, force: true })
+      rmSync(`${path}.tools`, { recursive: true, force: true })
     } catch {
       // A tree that cannot be removed now is retried by the next restart.
     }
@@ -3294,7 +3412,13 @@ export function createFactory(options: FactoryOptions): Factory {
   /** Content and type of every path that currently differs from the worktree base. */
   async function worktreeSnapshot(worktree: string): Promise<Map<string, EntryState>> {
     const snapshot = new Map<string, EntryState>()
-    for (const path of await changedPaths(worktree)) snapshot.set(path, entryState(join(worktree, path)))
+    // Readable public npm config still cannot be created or changed by a task.
+    const privatePaths = ['.npmrc', ...engineeringHiddenPaths(worktree)
+      .map((path) => posix.relative(worktree, path))
+      .filter((path) => path !== '.git')]
+    for (const path of new Set([...await changedPaths(worktree), ...privatePaths])) {
+      snapshot.set(path, entryState(join(worktree, path)))
+    }
     return snapshot
   }
 
@@ -3401,22 +3525,78 @@ export function createFactory(options: FactoryOptions): Factory {
     return `песочница bwrap недоступна: ${gate.sandboxError}. Тесты на хосте не запускаются.`
   }
 
+  /** Canonical root npm scripts from the immutable base or current candidate. */
+  async function packageScripts(worktree: string, base?: string): Promise<string> {
+    let content: string | undefined
+    if (base !== undefined) {
+      const path = await gitOutput(worktree, ['ls-tree', '--name-only', base, '--', 'package.json'])
+      if (path.trim() !== '') content = await gitOutput(worktree, ['show', `${base}:package.json`])
+    } else {
+      const target = resolveRoleTarget(worktree, 'package.json')
+      if ('error' in target) throw new Error('gate-definition drift: package.json must remain a regular candidate file')
+      if (existsSync(target.path)) {
+        if (!lstatSync(target.path).isFile()) throw new Error('gate-definition drift: package.json is not a file')
+        content = readFileSync(target.path, 'utf8')
+      }
+    }
+    try {
+      const manifest: unknown = content === undefined ? {} : JSON.parse(content)
+      if (manifest === null || typeof manifest !== 'object' || Array.isArray(manifest)) throw new Error('manifest')
+      const scripts: unknown = (manifest as Record<string, unknown>).scripts ?? {}
+      if (typeof scripts !== 'object' || scripts === null || Array.isArray(scripts) ||
+        Object.values(scripts).some((value) => typeof value !== 'string')) throw new Error('scripts')
+      return JSON.stringify(Object.entries(scripts).sort(([first], [second]) => first.localeCompare(second)))
+    } catch {
+      throw new Error('gate-definition drift: package.json has invalid scripts')
+    }
+  }
+
   /** Run the project gate in the evolve sandbox on the task worktree. */
   async function runGate(
     row: TaskRow,
     worktree: string,
     changed: readonly string[],
     ownArgv: readonly string[],
+    trustedScripts: string | undefined,
   ): Promise<SandboxResult & { timeoutMs: number }> {
     const timeoutMs = gateTimeoutMs()
-    const result = await sandbox({
-      ownerHome,
-      candidate: worktree,
-      liveModules: join(row.project_path, 'node_modules'),
-      command: gateArgv(row, worktree, changed, ownArgv),
-      timeoutMs,
-    })
-    return { ...result, timeoutMs }
+    if (options.commandRuntime !== undefined) {
+      if (await packageScripts(worktree) !== trustedScripts) throw new Error('gate-definition drift: package.json scripts changed from the checked base')
+      if (existsSync(join(worktree, 'package-lock.json')) || existsSync(join(worktree, 'npm-shrinkwrap.json'))) {
+        const installer = await options.commandRuntime({
+          taskId: row.id, role: 'executor', worktree, projectPath: row.project_path, prepareDependencies: false,
+        })
+        try {
+          const installed = await installer.run('npm ci --ignore-scripts')
+          if (!installed.ok) throw new Error(`установка зависимостей гейта не удалась:\n${outputTail(installed.output)}`)
+        } finally {
+          await installer.stop()
+        }
+        if (await packageScripts(worktree) !== trustedScripts) throw new Error('gate-definition drift: installation changed package.json scripts')
+      }
+    }
+    const gitView = options.commandRuntime === undefined ? undefined : await createEngineeringGitView(worktree)
+    try {
+      const result = await sandbox({
+        ownerHome,
+        candidate: worktree,
+        liveModules: join(row.project_path, 'node_modules'),
+        ...(options.commandRuntime === undefined ? {} : {
+          modules: 'candidate',
+          toolsDir: `${worktree}.tools`,
+          hiddenPaths: engineeringHiddenPaths(worktree),
+          readOnlyPaths: isSafeEngineeringNpmrc(worktree) ? [join(worktree, '.npmrc')] : [],
+          ...(gitView === undefined ? {} : {
+            gitView: { directory: gitView.directory, pointerFile: gitView.pointerFile },
+          }),
+        }),
+        command: gateArgv(row, worktree, changed, ownArgv),
+        timeoutMs,
+      })
+      return { ...result, timeoutMs }
+    } finally {
+      gitView?.stop()
+    }
   }
 
   /**
@@ -3450,44 +3630,54 @@ export function createFactory(options: FactoryOptions): Factory {
     const candidates = roleCandidates(row, role, models)
     if (candidates.length === 0) throw new Error(`нет подключённой модели роли «${roleLabelOf(role)}»`)
     const task = taskOf(row)
-    const failures: string[] = []
-    for (const model of candidates) {
-      const reasoningEffort = await roleTurnEffort(role, model)
-      roleSequence += 1
-      try {
-        const answer = await options.roleTurn({
-          role,
-          provider: model.provider,
-          model: model.id,
-          modelName: model.name,
-          cwd: worktree,
-          systemPrefix: roleSystemPrefix(role, task),
-          prompt,
-          sessionId: `factory-${role}-${executionGeneration}-${row.id}-${roleSequence}`,
-          reasoningEffort,
-          tools: roleTools(role, worktree, journal),
-        })
-        if (role === 'executor') executorProviders.set(row.id, model.provider)
-        return answer
-      } catch (error) {
-        // A stop of the daemon or of the task is not a model failure: the next
-        // model must not take over a turn the owner or the bot ended.
-        if (aborted(error)) throw error
-        const saved = findTaskStatement.get(row.id) as TaskRow | undefined
-        if (saved === undefined || saved.status !== 'running') throw error
-        const reason = error instanceof Error ? error.message : String(error)
-        failures.push(`${model.provider}/${model.id}: ${reason}`)
-        log(`task #${row.id}: роль «${roleLabelOf(role)}» (${role}), модель ${model.provider}/${model.id} отказала: ${reason}`)
+    const systemPrefix = withRoleSkill(roleSystemPrefix(role, task), role)
+    let runtime: FactoryCommandRuntime | undefined
+    try {
+      if (role !== 'reviewer') runtime = await options.commandRuntime?.({
+        taskId: row.id, role, worktree, projectPath: row.project_path,
+      })
+      const failures: string[] = []
+      let answer: string | undefined
+      for (const model of candidates) {
+        const reasoningEffort = await roleTurnEffort(role, model)
+        roleSequence += 1
+        try {
+          answer = await options.roleTurn({
+            role,
+            provider: model.provider,
+            model: model.id,
+            modelName: model.name,
+            cwd: worktree,
+            systemPrefix,
+            prompt,
+            sessionId: `factory-${role}-${executionGeneration}-${row.id}-${roleSequence}`,
+            reasoningEffort,
+            tools: [...roleTools(role, worktree, journal), ...(runtime?.tools ?? [])],
+          })
+          if (role === 'executor') executorProviders.set(row.id, model.provider)
+          break
+        } catch (error) {
+          // Stopping a task is not a model failure and must not start a failover.
+          if (aborted(error)) throw error
+          const saved = findTaskStatement.get(row.id) as TaskRow | undefined
+          if (saved === undefined || saved.status !== 'running') throw error
+          const reason = error instanceof Error ? error.message : String(error)
+          failures.push(`${model.provider}/${model.id}: ${reason}`)
+          log(`task #${row.id}: роль «${roleLabelOf(role)}» (${role}), модель ${model.provider}/${model.id} отказала: ${reason}`)
+        }
       }
+      if (answer === undefined) throw new Error(`роль «${roleLabelOf(role)}»: все модели отказали: ${failures.join('; ')}`)
+      return answer
+    } finally {
+      await runtime?.stop()
     }
-    throw new Error(`роль «${roleLabelOf(role)}»: все модели отказали: ${failures.join('; ')}`)
   }
 
-  async function writeDiff(worktree: string): Promise<{ diff: string; stat: string }> {
+  async function writeDiff(worktree: string, base: string): Promise<{ diff: string; stat: string }> {
     await tryGit(worktree, ['add', '-N', '--', '.'])
     return {
-      diff: await gitOutput(worktree, ['diff', '--no-color', '--no-textconv', 'HEAD']),
-      stat: await gitOutput(worktree, ['diff', '--stat', 'HEAD']),
+      diff: await gitOutput(worktree, ['diff', '--no-color', '--no-textconv', base]),
+      stat: await gitOutput(worktree, ['diff', '--stat', base]),
     }
   }
 
@@ -3657,12 +3847,27 @@ export function createFactory(options: FactoryOptions): Factory {
     }
     if (!(await stillOwned())) return
 
+    const trustedScripts = options.commandRuntime === undefined ? undefined : await packageScripts(worktree, base)
+
     let writerTests: string[]
     let snapshot = new Map<string, EntryState>()
     const capture = (): void => {
       snapshot = new Map()
       for (const path of writerTests) snapshot.set(path, entryState(join(worktree, path)))
       saveWriterTestsStatement.run(JSON.stringify(writerTests), JSON.stringify([...snapshot]), taskId)
+    }
+    const writeTests = async (remark?: string, existing: readonly string[] = []): Promise<string[] | undefined> => {
+      const before = await worktreeSnapshot(worktree)
+      const answer = await runRole(current, 'test_writer', worktree, writerPrompt(remark))
+      if (!(await stillOwned())) return undefined
+      const tests = [...new Set([...existing, ...writerTestPaths(answer, await changedPaths(worktree), worktree)])]
+      const violations = (await touchedByRound(worktree, before)).paths.filter((path) => !tests.includes(path))
+      if (violations.length === 0) return tests
+      for (const path of violations) {
+        if (!restoreState(worktree, path, before)) await restorePath(worktree, path, new Map())
+      }
+      await finishExecution(taskId, `Тестописец изменил файлы вне своих тестов: ${violations.join(', ')}. Нужна повторная постановка задачи.`)
+      return undefined
     }
     if (resuming) {
       // Writer tests are already committed; they are still off-limits to the
@@ -3688,12 +3893,14 @@ export function createFactory(options: FactoryOptions): Factory {
       capture()
     } else {
       // Test writer: the gate must be red after it; one retry with a remark.
-      const firstWriter = await runRole(current, 'test_writer', worktree, writerPrompt(undefined))
-      writerTests = writerTestPaths(firstWriter, await changedPaths(worktree))
+      const tests = await writeTests()
+      if (tests === undefined) return
+      writerTests = tests
       capture()
     }
     const forbidden = (path: string): boolean =>
-      writerTests.includes(path) || !task.footprint.some((entry) => footprintAllows(entry, path))
+      isEngineeringPrivatePath(path) || writerTests.includes(path) ||
+      !task.footprint.some((entry) => footprintAllows(entry, path))
     let gate: Awaited<ReturnType<typeof runGate>> = {
       ok: false,
       status: null,
@@ -3705,7 +3912,7 @@ export function createFactory(options: FactoryOptions): Factory {
     const writerGate = async (): Promise<boolean> => {
       const gateBefore = await worktreeSnapshot(worktree)
       const changed = [...new Set([...writerTests, ...(await changedPaths(worktree, base))])]
-      gate = await runGate(current, worktree, changed, parsed.argv)
+      gate = await runGate(current, worktree, changed, parsed.argv, trustedScripts)
       const note = gateSandboxNote(gate)
       if (note !== undefined) {
         await finishGateFailure(taskId, note)
@@ -3719,13 +3926,12 @@ export function createFactory(options: FactoryOptions): Factory {
     if (!resuming) {
       if (!(await writerGate())) return
       if (gate.ok) {
-        const retryWriter = await runRole(
-          current,
-          'test_writer',
-          worktree,
-          writerPrompt('Тесты тестописца не красные: гейт прошёл зелёным. Напиши тесты, которые падают на текущем коде.'),
+        const tests = await writeTests(
+          'Тесты тестописца не красные: гейт прошёл зелёным. Напиши тесты, которые падают на текущем коде.',
+          writerTests,
         )
-        writerTests = [...new Set([...writerTests, ...writerTestPaths(retryWriter, await changedPaths(worktree))])]
+        if (tests === undefined) return
+        writerTests = tests
         capture()
         if (!(await writerGate())) return
         if (gate.ok) {
@@ -3765,7 +3971,7 @@ export function createFactory(options: FactoryOptions): Factory {
       await showAcceptanceProgress(taskId, 'gate', round)
       const gateBefore = await worktreeSnapshot(worktree)
       const changed = [...new Set([...writerTests, ...(await changedPaths(worktree, base))])]
-      gate = await runGate(current, worktree, changed, parsed.argv)
+      gate = await runGate(current, worktree, changed, parsed.argv, trustedScripts)
       const note = gateSandboxNote(gate)
       if (note !== undefined) {
         await finishGateFailure(taskId, note)
@@ -3797,7 +4003,7 @@ export function createFactory(options: FactoryOptions): Factory {
       await refreshCards(taskId)
       await showAcceptanceProgress(taskId, 'review', round)
       if (!(await stillOwned())) return
-      const diff = await writeDiff(worktree)
+      const diff = await writeDiff(worktree, base)
       const answer = await runRole(current, 'reviewer', worktree, reviewerPrompt(diff.diff, diff.stat))
       const verdict = parseReview(answer)
       if (!verdict.approved) {
@@ -3828,8 +4034,8 @@ export function createFactory(options: FactoryOptions): Factory {
       await finishExecution(taskId, 'готово к приёмке', files, { base: resultBase, stats })
       const saved = findTaskStatement.get(taskId) as TaskRow | undefined
       if (saved === undefined) return
-      if (hasResult(saved) && task.risk === 'low' && autoacceptEnabled() && await autoacceptCanMerge(task.projectPath)) {
-        enqueueAcceptance(taskId)
+      if (hasResult(saved) && task.risk === 'low' && (autoacceptEnabled() || autopilotEnabled()) && await autoacceptCanMerge(task.projectPath)) {
+        await enqueueAcceptance(taskId)
       } else if (saved.acceptance_message_id === null) {
         await showAcceptanceCard(taskId)
       }
@@ -3902,6 +4108,15 @@ export function createFactory(options: FactoryOptions): Factory {
         // Only one task executes; any other interrupted row waits as queued.
         if (index === 0) resetRunningStatement.run(row.id)
         else requeueStatement.run(Date.now(), row.id)
+      }
+      if (autopilotEnabled() && options.ownerId() !== null) {
+        for (const row of listTasksStatement.all() as unknown as TaskRow[]) {
+          if (autoapprove(row)) continue
+          if (row.status === 'awaiting_human' && row.risk === 'low' && hasResult(row) &&
+            row.execution_note === 'готово к приёмке' && await autoacceptCanMerge(row.project_path)) {
+            await enqueueAcceptance(row.id)
+          }
+        }
       }
     } finally {
       executionHeld = false
@@ -4073,6 +4288,8 @@ export function createFactory(options: FactoryOptions): Factory {
           return { screen: await providersScreen() }
         case 'a':
           return { screen: autoacceptScreen() }
+        case 'u':
+          return { screen: autopilotScreen() }
         default:
           return { screen: homeScreen() }
       }
@@ -4219,6 +4436,13 @@ export function createFactory(options: FactoryOptions): Factory {
       store.kv.set(AUTOACCEPT_KV_KEY, autoacceptEnabled() ? '0' : '1')
       return { screen: autoacceptScreen() }
     }
+    if (op === 'ap') {
+      store.kv.set(AUTOPILOT_KV_KEY, autopilotEnabled() ? '0' : '1')
+      if (autopilotEnabled()) {
+        for (const row of listTasksStatement.all() as unknown as TaskRow[]) autoapprove(row)
+      }
+      return { screen: autopilotScreen() }
+    }
     if (op === 'ac' || op === 'rv') {
       const id = Number(parts[2])
       const row = Number.isSafeInteger(id) ? (findTaskStatement.get(id) as TaskRow | undefined) : undefined
@@ -4295,6 +4519,9 @@ export function createFactory(options: FactoryOptions): Factory {
       const id = Number(parts[2])
       const row = Number.isSafeInteger(id) ? (findTaskStatement.get(id) as TaskRow | undefined) : undefined
       if (row === undefined) return { screen: tasksScreen(), notice: 'Задача не найдена' }
+      if (row.status !== 'awaiting_approval') {
+        return { screen: taskScreen(id), notice: 'Задача уже не ждёт одобрения' }
+      }
       const rejected = op === 'ar'
       if (rejected) {
         setStatusStatement.run('rejected', id)
@@ -4472,6 +4699,11 @@ export function createFactory(options: FactoryOptions): Factory {
     },
 
     createTask(input: FactoryTaskInput): FactoryTask {
+      const requestId = input.requestId
+      if (requestId !== undefined &&
+        (typeof requestId !== 'string' || requestId.trim() === '' || requestId.length > 256)) {
+        throw new Error('requestId must be a non-empty string of at most 256 characters')
+      }
       const name = input.project === undefined ? undefined : input.project.trim()
       const project = name === undefined
         ? ownProject
@@ -4481,7 +4713,27 @@ export function createFactory(options: FactoryOptions): Factory {
           `Проект ${String(name)} не подключён. Подключённые проекты: ${projects().map((entry) => entry.name).join(', ')}.`,
         )
       }
-      const id = insertTask(input.text, project.id, input.title)
+      let id: number
+      if (requestId === undefined) {
+        id = insertTask(input.text, project.id, input.title)
+      } else {
+        store.db.prepare('BEGIN IMMEDIATE').run()
+        try {
+          const existing = findTaskRequestStatement.get(requestId) as { task_id: number } | undefined
+          if (existing !== undefined) {
+            const row = findTaskStatement.get(existing.task_id) as TaskRow | undefined
+            if (row === undefined) throw new Error('задача не найдена для requestId')
+            store.db.prepare('COMMIT').run()
+            return taskOf(row)
+          }
+          id = insertTask(input.text, project.id, input.title)
+          insertTaskRequestStatement.run(requestId, id)
+          store.db.prepare('COMMIT').run()
+        } catch (error) {
+          store.db.prepare('ROLLBACK').run()
+          throw error
+        }
+      }
       // The owner gets the same analysis card as a task typed into the menu.
       const chatId = options.ownerId()
       if (chatId !== null) {

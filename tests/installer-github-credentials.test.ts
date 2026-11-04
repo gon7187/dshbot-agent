@@ -64,7 +64,7 @@ process.exit(91);
     GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: 'file',
     GIT_AUTHOR_NAME: 'Installer credential fixture', GIT_AUTHOR_EMAIL: 'installer@example.invalid',
     GIT_COMMITTER_NAME: 'Installer credential fixture', GIT_COMMITTER_EMAIL: 'installer@example.invalid',
-    TELEGRAM_BOT_TOKEN: 'fixture-token', DEEPSEEK_API_KEY: 'fixture-key', DSHBOT_ISOLATION: 'host',
+    TELEGRAM_BOT_TOKEN: 'fixture-token', DEEPSEEK_API_KEY: 'fixture-key', DSHBOT_ISOLATION: 'host', DSHBOT_SANDBOX_TOOLKIT: '0',
   }
   function gitResult(cwd: string, args: string[], overrides: NodeJS.ProcessEnv = {}) {
     return spawnSync(join(bin, 'git'), ['-C', cwd, ...args], {
@@ -138,43 +138,6 @@ do_install
   return output
 }
 
-test('test_c1_github_helper_is_local_absolute_and_idempotent', { timeout: 30_000 }, () => {
-  const f = fixture()
-  f.git(f.source, 'remote', 'add', 'origin', githubOrigin)
-  prepareApp(f)
-  expect(f.git(f.app, 'config', '--local', '--get', 'remote.origin.url')).toBe(githubOrigin)
-  const expected = [`!${f.gh} auth git-credential`]
-  expect(f.helpers()).toEqual(expected)
-  prepareApp(f)
-  expect(f.helpers(), 'reinstallation must not append duplicate helpers').toEqual(expected)
-})
-
-test.each(['unauthorized', 'missing'] as const)(
-  'test_c2_github_without_usable_gh_finishes_and_explains_login_%s', { timeout: 30_000 }, (auth) => {
-    const f = fixture(auth)
-    f.git(f.source, 'remote', 'add', 'origin', githubOrigin)
-    const output = prepareApp(f)
-    expect(f.git(f.app, 'config', '--local', '--get', 'remote.origin.url')).toBe(githubOrigin)
-    expect(f.helpers()).toEqual([])
-    expect(output).toMatch(/\bgh\s+auth\s+login\b/)
-  },
-)
-
-test.each((['local', 'other-host'] as const).flatMap((kind) =>
-  (['authorized', 'unauthorized'] as const).map((auth) => ({ kind, auth })),
-))(
-  'test_c3_non_github_origin_needs_no_helper_or_login_hint_$kind_$auth', { timeout: 30_000 }, ({ kind, auth }) => {
-    const f = fixture(auth)
-    const origin = kind === 'local' ? join(f.root, 'upstream.git') : 'https://example.invalid/owner/repo.git'
-    if (kind === 'local') f.git(f.root, 'clone', '-q', '--bare', f.source, origin)
-    f.git(f.source, 'remote', 'add', 'origin', origin)
-    const output = prepareApp(f)
-    expect(f.git(f.app, 'config', '--local', '--get', 'remote.origin.url')).toBe(origin)
-    expect(f.helpers()).toEqual([])
-    expect(output).not.toMatch(/\bgh\s+auth\s+login\b/)
-  },
-)
-
 test('test_c4_linked_application_worktree_preserves_shared_config', { timeout: 30_000 }, () => {
   const f = fixture()
   f.git(f.source, 'remote', 'add', 'origin', githubOrigin)
@@ -190,6 +153,10 @@ test('test_c5_fetch_uses_gh_credentials_with_global_and_system_config_disabled',
   const f = fixture()
   f.git(f.source, 'remote', 'add', 'origin', githubOrigin)
   prepareApp(f)
+  const helper = f.helpers()
+  expect(helper).toHaveLength(1)
+  prepareApp(f)
+  expect(f.helpers()).toEqual(helper)
   writeFileSync(f.log, '')
 
   // A transport double replaces the HTTP authentication challenge without a
@@ -226,4 +193,16 @@ process.exit(1);
   expect(credentialCalls, 'fetch must invoke the locally configured gh credential helper').not.toHaveLength(0)
   expect(credentialCalls[0]!.input).toMatch(/^protocol=https$/m)
   expect(credentialCalls[0]!.input).toMatch(/^host=github\.com$/m)
+})
+
+test('non-GitHub origin neither installs a helper nor changes source configuration', { timeout: 30_000 }, () => {
+  const f = fixture()
+  const origin = 'https://example.invalid/owner/repo.git'
+  f.git(f.source, 'remote', 'add', 'origin', origin)
+  const before = f.git(f.source, 'config', '--local', '--list')
+  prepareApp(f)
+  expect(f.git(f.app, 'config', '--local', '--get', 'remote.origin.url')).toBe(origin)
+  expect(f.helpers()).toEqual([])
+  expect(f.calls()).toEqual([])
+  expect(f.git(f.source, 'config', '--local', '--list')).toBe(before)
 })

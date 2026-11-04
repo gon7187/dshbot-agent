@@ -9,7 +9,7 @@
 // Всё общение с Telegram идёт через контракт TelegramApi, поэтому поведение
 // проверяется на фейке, записывающем вызовы.
 
-import { TelegramApiError, type TelegramApi } from './api.js'
+import { TelegramApiError, type FileUpload, type TelegramApi, type TelegramCallOptions } from './api.js'
 import {
   extractButtons,
   markdownToPlain,
@@ -126,11 +126,21 @@ export function createReplyStream(options: ReplyStreamOptions): ReplyStream {
   let refreshTimer: Timer | undefined
   let messageId: number | undefined
 
-  /** Финал идёт через sendFormatted: после abort() ни одна следующая часть не уходит. */
+  /**
+   * Финал идёт через sendFormatted: после abort() ни одна следующая часть не
+   * уходит. Параметры передаются целиком, включая `files` и `options`: без
+   * `files` картинка в теле ответа ссылалась бы на `attach://<id>`, которого
+   * нет в запросе, и Telegram отвечал бы «media not found».
+   */
   const guardedApi: TelegramApi = {
-    call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
+    call<T = unknown>(
+      method: string,
+      params?: Record<string, unknown>,
+      files?: Record<string, FileUpload>,
+      options?: TelegramCallOptions,
+    ): Promise<T> {
       if (aborted) return Promise.reject(new StreamAbortedError())
-      return api.call<T>(method, params)
+      return api.call<T>(method, params, files, options)
     },
   }
 

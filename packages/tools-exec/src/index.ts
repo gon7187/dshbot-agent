@@ -38,12 +38,15 @@ import {
   constants as fsConstants,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
@@ -171,7 +174,7 @@ while ! (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null; do
   fi
   sleep 0.05
 done
-bash -c "$command"
+/bin/bash -c "$command"
 status=$?
 kill "$relay" 2>/dev/null
 exit "$status"
@@ -244,6 +247,8 @@ export interface ExecToolOptions {
   roots?: readonly ExecRoot[]
   /** Paths hidden even inside a mounted root (keys of the owner and the private state of the bot). */
   hidden?: readonly ExecHiddenPath[]
+  /** Disposable neutral repository metadata for a factory worktree. */
+  gitView?: EngineeringGitView
   /** Owner approval for `confirm` commands; absent means every confirm is refused. */
   approval?: ExecApproval
   /** Default foreground timeout in milliseconds; defaults to {@link DEFAULT_TIMEOUT_MS}. */
@@ -269,6 +274,15 @@ export interface ExecToolOptions {
    * otherwise picks another Node, see {@link guestNodeBinary}.
    */
   daemonNode?: string
+  /**
+   * Persistent tool directory (`DSHBOT_HOME/tools`) of the owner's sandbox.
+   * It is created when missing and mounted writable; the installer variables
+   * and the program directories join the command environment. Ignored in
+   * guest mode.
+   */
+  toolsDir?: string
+  /** Journal seam: one line for each command that added programs under `toolsDir`. */
+  log?: (text: string) => void
 }
 
 /** One extra directory of the owner inside the sandbox. */
@@ -281,6 +295,49 @@ export interface ExecRoot {
 export interface ExecHiddenPath {
   readonly path: string
   readonly allow?: readonly string[]
+}
+
+export const ENGINEERING_GIT_DIRECTORY = '/tmp/dshbot-engineering-git'
+
+export interface EngineeringGitView {
+  directory: string
+  pointerFile: string
+}
+
+/** Private read-only command entrypoints, independent of task-installed interpreter wrappers. */
+export function createTrustedNpmBin(): { bin: string; nodeBin: string; stop(): void } {
+  const node = realpathSync(process.execPath)
+  const nodeBin = dirname(node)
+  const prefix = dirname(nodeBin)
+  const candidates = [join(prefix, 'lib/node_modules/npm/bin/npm-cli.js'), join(prefix, 'share/nodejs/npm/bin/npm-cli.js')]
+  const npmCli = candidates.flatMap((path) => {
+    try {
+      const real = realpathSync(path)
+      return isWithin(real, prefix) && statSync(real).isFile() ? [real] : []
+    } catch { return [] }
+  })[0]
+  if (npmCli === undefined) throw new Error('trusted npm CLI is missing from the read-only Node install')
+  const bin = mkdtempSync(join(tmpdir(), 'dshbot-trusted-npm-'))
+  const stop = (): void => rmSync(bin, { recursive: true, force: true })
+  try {
+    symlinkSync(node, join(bin, 'node'))
+    symlinkSync(realpathSync('/bin/bash'), join(bin, 'bash'))
+    writeFileSync(join(bin, 'npm'), `#!${node}\nprocess.argv[1] = ${JSON.stringify(npmCli)}; require(${JSON.stringify(npmCli)})\n`, { mode: 0o755 })
+    return { bin, nodeBin, stop }
+  } catch (error) { stop(); throw error }
+}
+
+/** Overlay a private repository without changing the host worktree's Git pointer. */
+export function engineeringGitMountArgs(view: EngineeringGitView, candidate: string, readOnly: boolean): string[] {
+  const directory = resolve(view.directory)
+  const pointer = resolve(view.pointerFile)
+  if (realpathSync(directory) !== directory || realpathSync(pointer) !== pointer ||
+      !lstatSync(join(candidate, '.git')).isFile() ||
+      readFileSync(pointer, 'utf8') !== `gitdir: ${ENGINEERING_GIT_DIRECTORY}\n`) {
+    throw new Error('invalid engineering Git view')
+  }
+  return [readOnly ? '--ro-bind' : '--bind', directory, ENGINEERING_GIT_DIRECTORY,
+    '--ro-bind', pointer, join(candidate, '.git')]
 }
 
 /** Result of one command the owner typed directly (`!command`). */
@@ -366,14 +423,14 @@ function expandHome(path: string, home: string): string {
 /** Parse `DSHBOT_EXEC_RO_PATHS`, falling back to the toolchain defaults. */
 function readRoPaths(home: string, override?: readonly string[]): string[] {
   const raw = override === undefined ? process.env[RO_PATHS_ENV] : undefined
-  const values =
+  const values = override ?? (
     raw === undefined || raw.trim() === ''
       ? DEFAULT_RO_PATHS.map((path) => join(home, path))
       : raw
           .split(delimiter)
           .map((path) => path.trim())
           .filter((path) => path !== '')
-          .map((path) => resolve(expandHome(path, home)))
+          .map((path) => resolve(expandHome(path, home))))
   const seen = new Set<string>()
   const result: string[] = []
   for (const value of values) {
@@ -398,15 +455,141 @@ function isMiseShims(entry: string): boolean {
  * the shims are dead weight that shadow the real binary. The node directory
  * itself is mounted read-only with the toolchain.
  */
-function sandboxPath(parentPath: string): string {
+function sandboxPath(parentPath: string, toolBins: readonly string[] = []): string {
   const inherited = parentPath.split(delimiter).filter((entry) => entry !== '' && !isMiseShims(entry))
-  return [...new Set([dirname(process.execPath), ...inherited])].join(delimiter)
+  return [...new Set([dirname(process.execPath), ...toolBins, ...inherited])].join(delimiter)
+}
+
+const DEFAULT_PATH = '/usr/local/bin:/usr/bin:/bin'
+
+/** PATH of the daemon: where bwrap and env are found, with no tool directory in it. */
+function launcherPath(): string {
+  return process.env.PATH ?? DEFAULT_PATH
+}
+
+/**
+ * The profile with PATH set inside the sandbox. The argument list ends with
+ * `--`; `--setenv` goes before it, so only the command sees the tool directories.
+ */
+function withSandboxPath(
+  profile: readonly string[],
+  tools: ToolsLayout,
+  launchPath: string,
+  pyenv: string | undefined,
+): string[] {
+  const path = sandboxPath(launchPath, tools.bins)
+  if (pyenv === undefined) return [...profile.slice(0, -1), '--setenv', 'PATH', path, '--']
+  // The shared Python environment comes before every other directory: its
+  // python3 and pip are the defaults, and VIRTUAL_ENV makes `uv pip` follow.
+  return [
+    ...profile.slice(0, -1),
+    '--setenv', 'PATH', `${join(pyenv, 'bin')}${delimiter}${path}`,
+    '--setenv', 'VIRTUAL_ENV', pyenv,
+    '--',
+  ]
+}
+
+/** The one phrase of the exec description about the shared Python environment. */
+const PYTHON_ENV_HINT =
+  'python3 and pip are a shared venv: pip install into it, no new venv or pip --target.'
+
+/** Name of the shared Python environment under the tools directory. */
+const PYTHON_ENV_DIR = 'pyenv'
+
+/**
+ * The shared Python environment `<tools>/pyenv` when it is a ready venv
+ * (`bin/python3` and `bin/pip` are programs) whose real path stays inside the
+ * tools directory; undefined otherwise. Looked at on every command, so a venv
+ * created after the start is picked up without a restart.
+ */
+function readyPythonEnvironment(tools: ToolsLayout): string | undefined {
+  const pyenv = join(tools.root, PYTHON_ENV_DIR)
+  try {
+    if (!statSync(pyenv).isDirectory()) return undefined
+    if (!isWithin(realpathSync(pyenv), realpathSync(tools.root))) return undefined
+  } catch {
+    return undefined
+  }
+  return isProgram(join(pyenv, 'bin', 'python3')) && isProgram(join(pyenv, 'bin', 'pip')) ? pyenv : undefined
+}
+
+/**
+ * The persistent tool directory of the owner's sandbox, `DSHBOT_HOME/tools`:
+ * the installers' homes (uv, pip --user, npm -g, cargo, go) and their caches
+ * live here, because HOME is an empty tmpfs that forgets everything.
+ */
+export interface ToolsLayout {
+  readonly root: string
+  /** Installer variables of the sandbox; every value is inside `root`. */
+  readonly env: Readonly<Record<string, string>>
+  /** Directories the installers put programs in, in PATH order. */
+  readonly bins: readonly string[]
+}
+
+/** Where each installer keeps its programs and caches under the tools directory. */
+export function toolsLayout(root: string): ToolsLayout {
+  const tools = resolve(root)
+  const bins = [
+    join(tools, 'bin'),
+    join(tools, 'python', 'bin'),
+    join(tools, 'npm', 'bin'),
+    join(tools, 'cargo', 'bin'),
+    join(tools, 'go', 'bin'),
+  ]
+  return {
+    root: tools,
+    env: {
+      UV_TOOL_DIR: join(tools, 'uv', 'tools'),
+      UV_TOOL_BIN_DIR: join(tools, 'bin'),
+      PYTHONUSERBASE: join(tools, 'python'),
+      NPM_CONFIG_PREFIX: join(tools, 'npm'),
+      CARGO_INSTALL_ROOT: join(tools, 'cargo'),
+      CARGO_HOME: join(tools, 'cache', 'cargo'),
+      GOBIN: join(tools, 'go', 'bin'),
+      UV_CACHE_DIR: join(tools, 'cache', 'uv'),
+      PIP_CACHE_DIR: join(tools, 'cache', 'pip'),
+      // Font cache of matplotlib: in an empty tmpfs HOME it would be rebuilt by every command.
+      MPLCONFIGDIR: join(tools, 'cache', 'matplotlib'),
+      npm_config_cache: join(tools, 'cache', 'npm'),
+      GOMODCACHE: join(tools, 'cache', 'go-mod'),
+      GOCACHE: join(tools, 'cache', 'go-build'),
+    },
+    bins,
+  }
+}
+
+/** True for a regular file with an execute bit; a symlink counts through its target. */
+function isProgram(path: string): boolean {
+  try {
+    const info = statSync(path)
+    return info.isFile() && (info.mode & 0o111) !== 0
+  } catch {
+    return false
+  }
+}
+
+/** Executable programs in the tool directories, as `<dir>/<name>` keys. */
+function listToolPrograms(bins: readonly string[]): Map<string, string> {
+  const found = new Map<string, string>()
+  for (const dir of bins) {
+    let names: string[]
+    try {
+      names = readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of names) if (isProgram(join(dir, name))) found.set(join(dir, name), name)
+  }
+  return found
 }
 
 /** A parsed list of explicit parent variables replaced by tombstones for the child. */
-function childEnvironment(home: string): Record<string, string | undefined> {
+function childEnvironment(home: string, tools: ToolsLayout | undefined, launchPath: string): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {
-    PATH: sandboxPath(process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'),
+    // With persistent tools the sandbox PATH is set by bwrap itself (see
+    // withSandboxPath); the process that starts bwrap keeps the daemon PATH, so
+    // an installed program can never stand in for bwrap.
+    PATH: tools === undefined ? sandboxPath(launchPath) : launchPath,
     HOME: home,
     TMPDIR: '/tmp',
     TERM: 'dumb',
@@ -423,6 +606,9 @@ function childEnvironment(home: string): Record<string, string | undefined> {
   for (const name of Object.keys(process.env)) {
     if (!(name in env)) env[name] = undefined
   }
+  // The installers' homes come after the tombstones: the daemon's own
+  // variables of the same names never reach the sandbox, these always do.
+  if (tools !== undefined) Object.assign(env, tools.env)
   return env
 }
 
@@ -599,6 +785,10 @@ export function sandboxProfile(options: {
   roots?: readonly ExecRoot[]
   /** Paths never exposed, even inside a mounted root. */
   hidden?: readonly ExecHiddenPath[]
+  /** Disposable neutral repository metadata for a factory worktree. */
+  gitView?: EngineeringGitView
+  /** Persistent tool directory, mounted writable even inside a hidden tree. */
+  toolsDir?: string
 }): string[] {
   const home = resolve(options.home)
   const workspace = resolve(options.workspace)
@@ -606,7 +796,8 @@ export function sandboxProfile(options: {
     path: resolve(root.path),
     readOnly: root.readOnly === true,
   }))
-  const hidden = (options.hidden ?? []).map((entry) => ({
+  const hidden = (options.hidden ?? []).filter((entry) =>
+    options.gitView === undefined || resolve(entry.path) !== join(workspace, '.git')).map((entry) => ({
     path: resolve(entry.path),
     allow: (entry.allow ?? []).map((allowed) => resolve(allowed)),
   }))
@@ -686,6 +877,15 @@ export function sandboxProfile(options: {
   // The workspace is always mounted read-write, as the working directory.
   bound.add(workspace)
   binds.push({ path: workspace, mount: '--bind' })
+  // The tool directory is hidden with the rest of DSHBOT_HOME for the file
+  // tools; only the sandbox of the owner mounts it, and only itself.
+  if (options.toolsDir !== undefined) {
+    const toolsDir = resolve(options.toolsDir)
+    if (!bound.has(toolsDir) && existsSync(toolsDir)) {
+      bound.add(toolsDir)
+      binds.push({ path: toolsDir, mount: '--bind' })
+    }
+  }
   for (const root of extraRoots) addBind(root.path, root.readOnly)
 
   const masks: Array<{ path: string; mount: '--tmpfs' | '--empty-file' }> = []
@@ -730,21 +930,29 @@ export function sandboxProfile(options: {
   ])
   const bindTargets = new Set(binds.map((bind) => bind.path))
   const homeDirs = new Set<string>()
-  if (home !== sep) {
-    for (const bind of binds) {
-      if (!isWithin(bind.path, home) || bind.path === home) continue
-      let current = bind.path
-      while (current !== home) {
-        const parent = dirname(current)
-        if (parent === current) break
-        homeDirs.add(parent)
-        current = parent
-      }
-      try {
-        if (statSync(bind.path).isDirectory()) homeDirs.add(bind.path)
-      } catch {
-        // A target that does not exist cannot be bound anyway.
-      }
+  // Both HOME and /tmp are tmpfs: a bind target below either one gets implicit,
+  // writable parents, so the parents are pre-created read-only. A HOME inside
+  // /tmp is the nearer root.
+  const tmpfsRoots = [...(home === sep ? [] : [home]), '/tmp']
+  for (const bind of binds) {
+    const root = tmpfsRoots
+      .filter((candidate) => bind.path !== candidate && isWithin(bind.path, candidate))
+      .sort((left, right) => right.length - left.length)[0]
+    if (root === undefined) continue
+    let current = bind.path
+    while (current !== root) {
+      const parent = dirname(current)
+      if (parent === current) break
+      homeDirs.add(parent)
+      current = parent
+    }
+    // The chain of HOME includes HOME itself, as before; /tmp stays as it is.
+    if (root === '/tmp') homeDirs.delete(root)
+    else homeDirs.add(root)
+    try {
+      if (statSync(bind.path).isDirectory()) homeDirs.add(bind.path)
+    } catch {
+      // A target that does not exist cannot be bound anyway.
     }
   }
   const preparedHomeDirs = [...homeDirs]
@@ -766,6 +974,7 @@ export function sandboxProfile(options: {
     else args.push(layer.mount, layer.path)
   }
 
+  if (options.gitView !== undefined) args.push(...engineeringGitMountArgs(options.gitView, workspace, false))
   args.push('--chdir', workspace, '--')
   return args
 }
@@ -974,7 +1183,7 @@ function invalidateSandboxProbe(profile: readonly string[], cache: SandboxProbeC
  * {@link SANDBOX_PROBE_TTL_MS} is remembered; fail closed when it does not
  * start. A failure is never remembered, so the next command tries again.
  */
-function probeSandbox(profile: readonly string[], cache: SandboxProbeCache): void {
+function probeSandbox(profile: readonly string[], cache: SandboxProbeCache, launchPath: string): void {
   const key = profileKey(profile)
   const probedAt = cache.get(key)
   if (probedAt !== undefined) {
@@ -986,7 +1195,7 @@ function probeSandbox(profile: readonly string[], cache: SandboxProbeCache): voi
   const probe = spawnSync(profile[0] as string, [...profile.slice(1), '/bin/true'], {
     encoding: 'utf8',
     timeout: 10_000,
-    env: { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8' },
+    env: { PATH: launchPath, LANG: 'C.UTF-8' },
   })
   if (probe.error !== undefined) {
     cache.delete(key)
@@ -1860,12 +2069,13 @@ async function admit(
 
 /** Build a shell executor whose argv is wrapped in the project's bwrap profile. */
 function sandboxedExecutor(
-  profile: readonly string[],
+  currentProfile: () => readonly string[],
   relay: { readonly script: string; readonly socket: string; readonly node: string } | undefined,
   guest = false,
 ): typeof LocalBashExecutor {
   return class SandboxedBashExecutor extends LocalBashExecutor {
     override execute(spec: ShellExecSpec): Promise<ShellExecution> {
+      const profile = currentProfile()
       // The data cap applies to the command and every child of it. It bounds
       // memory actually allocated, not address space: Node reserves a large
       // virtual range and must still start. The relay is started by the wrapper
@@ -1875,9 +2085,9 @@ function sandboxedExecutor(
         ? `ulimit -d ${Math.floor(GUEST_MEMORY_BYTES / 1024)} 2>/dev/null || ` +
           `{ echo "exec: не удалось установить предел памяти гостя" >&2; exit 1; }; ${spec.command}`
         : spec.command
-      if (relay === undefined) return this.executeArgv(spec, [...CLEAN_START, ...profile, 'bash', '-c', command])
+      if (relay === undefined) return this.executeArgv(spec, [...CLEAN_START, ...profile, '/bin/bash', '-c', command])
       // The command is an argument, not part of the script: no re-quoting.
-      return this.executeArgv(spec, [...CLEAN_START, ...profile, 'bash', '-c', RELAY_WRAPPER, 'dshbot-exec', command])
+      return this.executeArgv(spec, [...CLEAN_START, ...profile, '/bin/bash', '-c', RELAY_WRAPPER, 'dshbot-exec', command])
     }
   }
 }
@@ -1895,6 +2105,10 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
 
   const roPaths = readRoPaths(home, options.roPaths)
   const guest = options.guest === true
+  // The persistent tools of the owner; a guest never gets them.
+  const persistent: ToolsLayout | undefined =
+    !guest && options.toolsDir !== undefined ? toolsLayout(options.toolsDir) : undefined
+  if (persistent !== undefined) mkdirSync(persistent.root, { recursive: true, mode: 0o700 })
   // Paths of the owner that must never appear in a guest namespace, mounted as
   // a toolchain directory or as the node binary. HOME itself is always one.
   const realOrResolved = (path: string): string => {
@@ -1966,7 +2180,9 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
       networkDir = undefined
     }
   }
-  const profile = guest
+  // Where bwrap and env are found, for the probe and every launch alike.
+  const launchPath = launcherPath()
+  const baseProfile = guest
     ? guestSandboxProfile({
         ...(networkDir === undefined ? {} : { networkDir }),
         masks: [...ownerRoots],
@@ -1981,7 +2197,16 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
         ...(networkDir === undefined ? {} : { networkDir }),
         ...(options.roots === undefined ? {} : { roots: options.roots }),
         ...(options.hidden === undefined ? {} : { hidden: options.hidden }),
+        ...(options.gitView === undefined ? {} : { gitView: options.gitView }),
+        ...(persistent === undefined ? {} : { toolsDir: persistent.root }),
       })
+  const profileNow = (): readonly string[] =>
+    persistent === undefined
+      ? baseProfile
+      : withSandboxPath(baseProfile, persistent, launchPath, readyPythonEnvironment(persistent))
+  // Taken again at the start of every command: the shared Python environment
+  // may appear (or go) between two commands.
+  let profile: readonly string[] = profileNow()
   /** Successful probes of this capability's profiles, keyed by the exact argv. */
   const probeCache: SandboxProbeCache = new Map()
   const proxyUrl = `http://127.0.0.1:${RELAY_PORT}`
@@ -1989,7 +2214,7 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
   const ctx = new Context()
   await ctx.plugin(SubprocessLocal)
   await ctx.plugin(JobsLocal)
-  await ctx.plugin(sandboxedExecutor(profile, relay, guest), {
+  await ctx.plugin(sandboxedExecutor(() => profile, relay, guest), {
     cwd: workspace,
     timeoutMs: defaultTimeout,
     maxTimeoutMs: maxTimeout,
@@ -2023,7 +2248,7 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
         }
         return env
       })()
-    : childEnvironment(home)
+    : childEnvironment(home, persistent, launchPath)
   const environment: Record<string, string | undefined> = {
     ...baseEnvironment,
     ...(relay === undefined
@@ -2041,6 +2266,22 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
           DSHBOT_EXEC_NET_SOCKET: relay.socket,
           DSHBOT_EXEC_NET_NODE: relay.node,
         }),
+  }
+
+  // Programs in the tool directories when a command starts: every call keeps
+  // its own set and compares only with it at the end, so a command that adds
+  // one leaves a line in the journal, a command that adds nothing leaves none,
+  // and a concurrent call never takes the credit for another one's install.
+  function snapshotPrograms(): ReadonlySet<string> | undefined {
+    return persistent === undefined ? undefined : new Set(listToolPrograms(persistent.bins).keys())
+  }
+  function journalNewPrograms(before: ReadonlySet<string> | undefined): void {
+    if (persistent === undefined || before === undefined) return
+    const added = [...listToolPrograms(persistent.bins)].filter(([key]) => !before.has(key)).map(([, name]) => name)
+    if (added.length === 0) return
+    const names = [...new Set(added)].sort()
+    const shown = names.slice(0, 20).join(', ')
+    options.log?.(`exec: new programs in the tools directory: ${shown}${names.length > 20 ? `, +${names.length - 20}` : ''}`)
   }
 
   /** Refuse every command while the network bridge is not usable. */
@@ -2111,15 +2352,18 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
     command: string,
     timeoutSec: unknown,
     secrets: unknown,
+    signal?: AbortSignal,
   ): Promise<string> {
     if (stopped !== undefined) throw new Error('exec остановлен: сетевой прокси песочницы закрыт, команда не запущена.')
     requireNetwork()
-    probeSandbox(profile, probeCache)
+    profile = profileNow()
+    probeSandbox(profile, probeCache, launchPath)
     const extraEnv = secretEnvironment(secrets)
     const timeoutMs = clampTimeout(timeoutSec, defaultTimeout, maxTimeout)
+    const programsBefore = snapshotPrograms()
     let handle: Awaited<ReturnType<typeof shell.execute>>
     try {
-      handle = await shell.execute(resolveSpec(command, timeoutMs, undefined, extraEnv))
+      handle = await shell.execute(resolveSpec(command, timeoutMs, signal, extraEnv))
     } catch (error) {
       // The sandbox may have failed before the command started.
       invalidateSandboxProbe(profile, probeCache)
@@ -2138,6 +2382,7 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
       discardReaderSpill(handle.observed.stderr)
       throw error
     }
+    journalNewPrograms(programsBefore)
     // A non-zero outcome (including a bwrap failure that prevented bash from
     // starting) drops the remembered probe: the next command verifies the
     // sandbox again and reports the clear error instead of trusting the window.
@@ -2178,11 +2423,14 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
     if (stopped !== undefined) throw new Error('exec остановлен: сетевой прокси песочницы закрыт, команда не запущена.')
     await admit(command, options.approval)
     requireNetwork()
-    probeSandbox(profile, probeCache)
+    profile = profileNow()
+    probeSandbox(profile, probeCache, launchPath)
     const timeoutMs = clampTimeout(options.timeoutSec, defaultTimeout, maxTimeout)
+    const programsBefore = snapshotPrograms()
     try {
       const handle = await shell.execute(resolveSpec(command, timeoutMs, options.signal))
       const result = await handle.result()
+      journalNewPrograms(programsBefore)
       if (result.exitCode !== 0) invalidateSandboxProbe(profile, probeCache)
       return {
         exitCode: result.exitCode,
@@ -2223,7 +2471,8 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
   function startJob(command: string, extraEnv: Record<string, string> = {}): string {
     if (stopped !== undefined) throw new Error('exec остановлен: сетевой прокси песочницы закрыт, команда не запущена.')
     requireNetwork()
-    probeSandbox(profile, probeCache)
+    profile = profileNow()
+    probeSandbox(profile, probeCache, launchPath)
     if (!existsSync(workspace)) throw new Error(`exec: workspace ${workspace} disappeared`)
     const id = jobs.start({
       kind: 'bash',
@@ -2243,8 +2492,9 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
         // its quoting stays untouched, exactly like the foreground path.
         const argv =
           relay === undefined
-            ? [...CLEAN_START, ...profile, 'bash', '-c', command]
-            : [...CLEAN_START, ...profile, 'bash', '-c', RELAY_WRAPPER, 'dshbot-exec', command]
+            ? [...CLEAN_START, ...profile, '/bin/bash', '-c', command]
+            : [...CLEAN_START, ...profile, '/bin/bash', '-c', RELAY_WRAPPER, 'dshbot-exec', command]
+        const programsBefore = snapshotPrograms()
         let spawned: ReturnType<typeof ctx.subprocess.spawn>
         try {
           spawned = ctx.subprocess.spawn({
@@ -2295,6 +2545,7 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
         const timer = setInterval(() => flush(), OUTPUT_POLL_MS)
         timer.unref?.()
         const settle = (): void => {
+          journalNewPrograms(programsBefore)
           flush(true)
           clearInterval(timer)
           state.settled = true
@@ -2505,49 +2756,43 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
       ...(guest ? { guest: GUEST_EXEC_DEFINITION } : {}),
       get description(): string {
         return (
-          'Run a shell command in an isolated sandbox. The workspace is writable; the rest of the machine is ' +
-          'not. The sandbox has its own network namespace with no direct route out: the public internet is ' +
-          'reached through the daemon proxy (http_proxy, https_proxy and all_proxy), which resolves names and ' +
-          'allows public addresses only. Local, private, loopback, link-local and cloud metadata addresses ' +
-          '(for example 169.254.169.254) are closed by IP and by name, so a web_fetch refusal because of an ' +
-          'address must not be routed around through exec. Dangerous commands need the owner to press an ' +
-          'approval button. For a long command use background=true: it returns a job id at once, and ' +
-          'exec_status with wait_sec (optionally with pattern) waits for that job, so do not sleep in ' +
-          'exec to poll it. Job tools: exec_status, exec_write, exec_list and exec_stop. Secrets are ' +
-          'passed by name in `secrets` and become environment variables; their values never appear in ' +
-          `the output. ${secretNamesText()}`
+          'Run a shell command in a sandbox; only the workspace is writable. Network: public addresses via ' +
+          'the daemon proxy (http_proxy, https_proxy, all_proxy); local, private and metadata addresses are ' +
+          'closed, never bypass a web_fetch refusal via exec. Dangerous commands need the owner\'s ' +
+          'approval. Long command: background=true returns a job id; wait with exec_status wait_sec ' +
+          '(optionally pattern), no sleeping; also exec_write, exec_list, exec_stop. The output never ' +
+          `shows secret values. ${persistent === undefined ? '' : PYTHON_ENV_HINT + ' '}${secretNamesText()}`
         )
       },
       get inputSchema(): Record<string, unknown> {
         return {
           type: 'object',
           properties: {
-            command: { type: 'string', description: 'Shell command line to run with bash -c.' },
+            command: { type: 'string', description: 'Command line, run with bash -c.' },
             purpose: {
               type: 'string',
               description:
-                'Why you are running the command, in your own words. Required when the owner has to confirm a ' +
-                'command: the approval card shows it in a signed «Зачем (со слов бота)» block before the ' +
-                'explanation built from the command itself.',
+                'Why you run it, in your words. Required when the owner must confirm: the approval card shows ' +
+                'it as «Зачем (со слов бота)».',
             },
             timeout_sec: {
               type: 'number',
-              description: 'Foreground timeout in seconds (default 120, maximum 600).',
+              description: 'Foreground timeout, seconds (default 120, max 600).',
             },
             background: {
               type: 'boolean',
-              description: 'Start the command as a background job and return its id immediately.',
+              description: 'Run as a background job and return its id.',
             },
             secrets: {
               type: 'array',
               items: { type: 'string' },
-              description: `Names of secrets to pass as environment variables. ${secretNamesText()}`,
+              description: `Secret names to pass as environment variables. ${secretNamesText()}`,
             },
           },
           required: ['command'],
         }
       },
-      async execute(args) {
+      async execute(args, context) {
         const command = args.command
         if (typeof command !== 'string' || command.trim() === '') {
           throw new Error('exec: command must be a non-empty string')
@@ -2556,13 +2801,13 @@ export async function createExecTools(options: ExecToolOptions): Promise<ExecToo
           await admit(command, undefined, true)
           // A guest has no background tools, no secrets and no time beyond the
           // guest cap: every extra argument of a forged call is ignored.
-          return runForeground(command, args.timeout_sec, undefined)
+          return runForeground(command, args.timeout_sec, undefined, context?.signal)
         }
         const purpose = typeof args.purpose === 'string' ? args.purpose : undefined
         await admit(command, options.approval, false, purpose, true)
         const extraEnv = secretEnvironment(args.secrets)
         if (args.background === true) return startBackground(command, extraEnv)
-        return runForeground(command, args.timeout_sec, args.secrets)
+        return runForeground(command, args.timeout_sec, args.secrets, context?.signal)
       },
     },
     {

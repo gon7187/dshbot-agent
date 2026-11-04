@@ -379,7 +379,7 @@ export function createGoalJudge(options: JudgeOptions): GoalJudge {
 
 // --- spend measurement ---------------------------------------------------------------------------
 
-/** What the main session log says about the tokens of the new events. */
+/** What the session log says about the tokens of the new events. */
 export interface UsageSlice {
   usd: number
   inputTokens: number
@@ -408,7 +408,7 @@ function usageOf(value: unknown): TokenUsage {
 }
 
 /**
- * Reads the durable JSONL log of the `main` session and prices the tokens of
+ * Reads the durable JSONL log of one session (the session of a cycle) and prices the tokens of
  * assistant messages. Only complete lines are consumed, so a log that is being
  * appended to never loses or double-counts an event.
  */

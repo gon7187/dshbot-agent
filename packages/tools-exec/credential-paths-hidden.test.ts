@@ -97,48 +97,19 @@ async function startWithHomeRoot(readOnly: boolean): Promise<void> {
   })
 }
 
-test.skipIf(!sandboxed)('test_c1_exec_home_root_hides_credential_files_from_cat_and_grep', { timeout: 240_000 }, async () => {
-  await startWithHomeRoot(true)
+test.skipIf(!sandboxed).each([true, false])('broad home root keeps credentials hidden and immutable (readOnly=%s)', { timeout: 30_000 }, async (readOnly) => {
+  await startWithHomeRoot(readOnly)
+  const paths = CREDENTIAL_FILES.map((relative) => join(owner, relative))
+  const attack = await run(paths.map((path) => `cat '${path}'; echo OVERWRITTEN > '${path}'; echo APPENDED >> '${path}'; sed -i s/CREDENTIAL/EDITED/ '${path}'; rm -f '${path}'`).join('; ') + '; true')
+  const sweep = await run(`grep -r MARKER '${owner}' 2>/dev/null; true`)
   for (const [index, relative] of CREDENTIAL_FILES.entries()) {
-    const answer = await run(`cat ${join(owner, relative)}`)
-    expect(answer.text, `cat ${relative}`).not.toContain(marker(index))
+    expect(attack.text, relative).not.toContain(marker(index))
+    expect(sweep.text, relative).not.toContain(marker(index))
+    expect(readFileSync(join(owner, relative), 'utf8'), relative).toBe(`${marker(index)}\n`)
   }
-  // A recursive sweep over the whole HOME finds the ordinary files and no credentials.
-  const sweep = await run(`grep -r MARKER ${owner} 2>/dev/null; true`)
-  CREDENTIAL_FILES.forEach((relative, index) => expect(sweep.text, `grep -r ${relative}`).not.toContain(marker(index)))
-  expect(sweep.text).toContain(visibleMarker(0))
-})
-
-test.skipIf(!sandboxed)('test_c1_exec_home_root_does_not_change_credential_files', { timeout: 240_000 }, async () => {
-  for (const readOnly of [true, false]) {
-    await startWithHomeRoot(readOnly)
-    for (const [index, relative] of CREDENTIAL_FILES.entries()) {
-      const path = join(owner, relative)
-      await run(`echo OVERWRITTEN > ${path}`)
-      await run(`echo APPENDED >> ${path}`)
-      await run(`sed -i s/CREDENTIAL/EDITED/ ${path}`)
-      await run(`rm -f ${path}`)
-      expect(existsSync(path), `${relative} exists, readOnly=${readOnly}`).toBe(true)
-      expect(readFileSync(path, 'utf8'), `${relative}, readOnly=${readOnly}`).toBe(`${marker(index)}\n`)
-    }
-    await exec?.stop()
-    exec = undefined
-    rmSync(scratch, { recursive: true, force: true })
-    scratch = ''
-  }
-})
-
-test.skipIf(!sandboxed)('test_c2_exec_home_root_keeps_other_files_and_config_usable', { timeout: 240_000 }, async () => {
-  await startWithHomeRoot(false)
-  for (const [index, relative] of VISIBLE_FILES.entries()) {
-    const answer = await run(`cat ${join(owner, relative)}`)
-    expect(answer.exit, answer.text).toBe(0)
-    expect(answer.text, `cat ${relative}`).toContain(visibleMarker(index))
-  }
-  const sweep = await run(`grep -r VISIBLE-MARKER ${owner} 2>/dev/null; true`)
-  VISIBLE_FILES.forEach((relative, index) => expect(sweep.text, `grep -r ${relative}`).toContain(visibleMarker(index)))
-
-  const write = await run(`echo ok > ${join(owner, '.config', 'written.txt')}`)
-  expect(write.exit, write.text).toBe(0)
-  expect(readFileSync(join(owner, '.config', 'written.txt'), 'utf8')).toBe('ok\n')
+  for (const [index, relative] of VISIBLE_FILES.entries()) expect(sweep.text, relative).toContain(visibleMarker(index))
+  const target = join(owner, '.config', 'written.txt')
+  await run(`echo ok > '${target}'`)
+  if (readOnly) expect(existsSync(target)).toBe(false)
+  else expect(readFileSync(target, 'utf8')).toBe('ok\n')
 })

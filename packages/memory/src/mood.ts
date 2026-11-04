@@ -79,9 +79,8 @@ export function moodBlock(filePath: string): string {
 }
 
 const MOOD_DESCRIPTION =
-  'Веди своё настроение: одна-две короткие живые строки в memory/mood.md (обида, радость, усталость, ' +
-  'что задело или порадовало). Оно попадает в пробуждение и в снимок памяти. Лимит 600 символов, включая ' +
-  'пробелы; запись сверх лимита отклоняется без изменения файла — тогда сократи её.'
+  'Keep your mood: one or two short live lines in memory/mood.md (hurt, joy, fatigue). It goes into the ' +
+  'wake-up and the memory snapshot. An over-limit entry is rejected: shorten it.'
 
 /** The `update_mood` tool over `<home>/memory/mood.md`. */
 export function createUpdateMoodTool(moodPath: string): RunnerTool {
@@ -93,7 +92,7 @@ export function createUpdateMoodTool(moodPath: string): RunnerTool {
       properties: {
         text: {
           type: 'string',
-          description: `Новое настроение; не больше ${MOOD_LIMIT} символов, пробелы тоже считаются.`,
+          description: `New mood, up to ${MOOD_LIMIT} characters with spaces.`,
         },
       },
       required: ['text'],

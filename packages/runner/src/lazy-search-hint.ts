@@ -11,22 +11,58 @@
 // so "кампании" meets "кампаний" and "campaigns" meets "campaign". The cut is
 // limited to inflectional endings, so unrelated words with a common prefix
 // ("погода" / "Погрузка") stay different.
+//
+// A tool name is written in camelCase (`mcp__homeassistant__intent__HassTurnOff`),
+// so the words a person reads there ("turn off") must also be the words the
+// matcher sees. Both sides of the comparison are split at the camelCase
+// boundary before case folding; folding first would glue the whole name into
+// one unsplittable word and hide the tool from a query that names its parts.
 
 /** One-line, case-folded form of a tool name or description. */
 export function lazySearchText(text: string): string {
   return text.replace(/\s+/gu, ' ').trim().toLocaleLowerCase()
 }
 
-/** The words of a query in order; a blank query yields no words. */
-export function lazyQueryTokens(query: string): string[] {
-  return lazySearchText(query)
+/**
+ * The tokens of a query in order, still bearing their case. The case is what
+ * marks a camelCase boundary, so the split of {@link splitCamelCase} has to see
+ * the original text; only the comparison form is folded later.
+ */
+function rawQueryTokens(query: string): string[] {
+  return query
+    .replace(/\s+/gu, ' ')
+    .trim()
     .split(' ')
     .filter((token) => token.length > 0)
 }
 
-/** Every word of a name or description, with punctuation and `_` as separators. */
+/** The words of a query in order; a blank query yields no words. */
+export function lazyQueryTokens(query: string): string[] {
+  return rawQueryTokens(query).map((token) => token.toLocaleLowerCase())
+}
+
+/**
+ * A camelCase name split into its parts: `HassTurnOff` becomes `Hass Turn Off`.
+ * The boundary is the lowercase-to-uppercase change inside one word (and the end
+ * of a run of capitals, so `GetURLPath` becomes `Get URL Path`); it must be
+ * found on the original text, because case folding erases it and leaves the
+ * whole tool name as one unsplittable word.
+ */
+function splitCamelCase(text: string): string {
+  return text
+    .replace(/(\p{Ll})(\p{Lu})/gu, '$1 $2')
+    .replace(/(\p{Lu})(\p{Lu}\p{Ll})/gu, '$1 $2')
+}
+
+/**
+ * Every word of a name or description: punctuation and `_` separate words, and
+ * so does the camelCase boundary inside a tool name (`mcp__server__HassTurnOff`
+ * yields `mcp`, `server`, `hass`, `turn`, `off`). The split happens before case
+ * folding, otherwise `HassTurnOff` collapses into one word and "turn off" has
+ * nothing to match.
+ */
 export function lazySearchWords(text: string): string[] {
-  return lazySearchText(text).match(/[\p{L}\p{N}]+/gu) ?? []
+  return (splitCamelCase(text).match(/[\p{L}\p{N}]+/gu) ?? []).map((word) => word.toLocaleLowerCase())
 }
 
 /**
@@ -42,15 +78,19 @@ interface QueryUnit {
 function queryUnits(query: string): QueryUnit[] {
   const seen = new Set<string>()
   const units: QueryUnit[] = []
-  for (const token of lazyQueryTokens(query)) {
-    if (token.includes('__')) {
-      const key = `literal:${token}`
+  for (const token of rawQueryTokens(query)) {
+    const folded = token.toLocaleLowerCase()
+    if (folded.includes('__')) {
+      const key = `literal:${folded}`
       if (seen.has(key)) continue
       seen.add(key)
-      units.push({ literal: token })
+      units.push({ literal: folded })
       continue
     }
-    for (const word of token.match(/[\p{L}\p{N}]+/gu) ?? []) {
+    // The words come from the raw token: the query may spell a tool name the
+    // way the model sees it (`HassTurnOff`), and case folding would erase the
+    // very boundary that makes "turn" and "off" searchable words.
+    for (const word of splitCamelCase(token).match(/[\p{L}\p{N}]+/gu) ?? []) {
       const stem = lazyWordStem(word)
       const key = `stem:${stem}`
       if (seen.has(key)) continue
@@ -170,10 +210,15 @@ export function rankLazyCandidates<T extends LazySearchCandidate>(
 ): Array<RankedLazyCandidate<T>> {
   const units = queryUnits(query)
   if (units.length === 0 || limit <= 0) return []
+  const hasLiteral = units.some((unit) => unit.literal !== undefined)
   return candidates
     .map((candidate) => {
-      const text = lazySearchText(`${candidate.name} ${candidate.description}`)
-      const stems = new Set(lazySearchWords(text).map(lazyWordStem))
+      const raw = `${candidate.name} ${candidate.description}`
+      // The words come from the raw text: case folding would erase the
+      // camelCase boundaries that split a tool name into searchable words.
+      const stems = new Set(lazySearchWords(raw).map(lazyWordStem))
+      // A qualified name stays a literal, so the comparison is on the folded text.
+      const text = hasLiteral ? lazySearchText(raw) : ''
       let hits = 0
       for (const unit of units) {
         if (unit.literal !== undefined) {

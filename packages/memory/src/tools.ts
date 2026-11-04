@@ -62,15 +62,13 @@ function operationsOf(value: unknown): EntryOperation[] {
 }
 
 const MEMORY_DESCRIPTION =
-  'Save durable facts to persistent memory. The stores are memory/MEMORY.md (environment: tool quirks, project ' +
-  'conventions, paths, endpoints; up to 2200 bytes) and memory/USER.md (who the owner is: persona, preferences, ' +
-  'communication and work style; up to 1400 bytes). One fact goes to ONE store. Write declarative facts, not ' +
-  'instructions: "Owner prefers concise answers" is right, "Always answer concisely" is wrong. Do not record ' +
-  'failures, unresolved problems, or prohibitions about tools ("exec is broken", "never use X"): they harden into ' +
-  'self-imposed bans. Procedures and pitfalls belong in a skill, not here; use `recall` for session history. ' +
-  'Use one call with an operations array; the character limit is checked on the final state, so one batch may ' +
-  'remove or replace stale entries and add a new one together. When a store is full, compress: replace stale ' +
-  'entries or remove them in the same call instead of dropping the new fact.'
+  'Short index of durable facts; details live in knowledge topics. Stores: memory/MEMORY.md (environment: tool quirks, project ' +
+  'conventions, paths, endpoints; up to 2200 bytes) and memory/USER.md (the owner: persona, preferences, ' +
+  'style; up to 1400 bytes). One fact goes to ONE store. Write declarative facts, not instructions: ' +
+  '"Owner prefers concise answers", not "Always answer concisely". Do not record failures, unresolved ' +
+  'problems or tool prohibitions ("never use X"): they harden into self-imposed bans. Procedures belong in ' +
+  'a skill; history is in `recall`. One call with an operations array; the limit is checked on the final ' +
+  'state, so a batch can replace or remove stale entries and add the new one.'
 
 /** The `memory` tool over `<home>/memory/MEMORY.md` and `<home>/memory/USER.md`. */
 export function createMemoryTool(home: string): RunnerTool {
@@ -88,17 +86,17 @@ export function createMemoryTool(home: string): RunnerTool {
         target: {
           type: 'string',
           enum: ['user', 'memory'],
-          description: "Which store to change: 'user' for USER.md, 'memory' for MEMORY.md.",
+          description: "'user' is USER.md, 'memory' is MEMORY.md.",
         },
         operations: {
           type: 'array',
-          description: 'Operations are applied in order; the size limit is checked on the final state.',
+          description: 'Applied in order.',
           items: {
             type: 'object',
             properties: {
               op: { type: 'string', enum: ['add', 'replace', 'remove'] },
-              text: { type: 'string', description: 'New entry text for add/replace.' },
-              match: { type: 'string', description: 'Exact substring identifying one existing entry for replace/remove.' },
+              text: { type: 'string', description: 'Entry text for add/replace.' },
+              match: { type: 'string', description: 'Exact substring of one existing entry, for replace/remove.' },
             },
             required: ['op'],
           },
@@ -119,7 +117,8 @@ export function createMemoryTool(home: string): RunnerTool {
         if (error instanceof EntryStoreError && error.code === 'limit') {
           throw new Error(
             `${error.message}. Лимит этого хранилища — ${limit} байт: сожмите запись — замените или удалите ` +
-              'устаревшие записи в том же вызове memory, проверка идёт по итоговому размеру.',
+              'устаревшие записи в том же вызове memory, проверка идёт по итоговому размеру. Или вынесите подробности ' +
+              'в тему knowledge, а в памяти оставьте короткую строку-ссылку на эту тему.',
           )
         }
         throw error
@@ -148,19 +147,18 @@ export function createRecallTool(index: RecallIndex, options: RecallToolOptions 
   return {
     name: RECALL_TOOL_NAME,
     description:
-      'Search earlier owner dialogue turns, the journal, schedule runs and the text files of the workspace ' +
-      '(notes and reports: .md and .txt) by keyword. Use it when an answer depends on prior work, decisions, ' +
-      'dates, people, files or preferences that are not already in the current context. Hits carry a date and a ' +
-      'source; workspace hits carry the path relative to the workspace and the matched line range; schedule runs ' +
-      'rank lower. Do not repeat a search whose supplied context already answers the question.',
+      'Search earlier owner dialogue, the journal, schedule runs and workspace notes (.md, .txt) by keyword. ' +
+      'Use it when an answer depends on prior work, decisions, dates, people, files or preferences missing from ' +
+      'the context. Hits carry a date and source (workspace: path and line range); schedule runs rank ' +
+      'lower. Do not repeat a search the context already answers.',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'Keywords to search for; word characters only, several words are combined with OR.',
+          description: 'Keywords: word characters only, combined with OR.',
         },
-        limit: { type: 'integer', minimum: 1, maximum: 50, description: 'Maximum number of hits, default 10.' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: 'Max hits, default 10.' },
       },
       required: ['query'],
     },

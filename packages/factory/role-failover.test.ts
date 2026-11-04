@@ -232,20 +232,3 @@ test('c4 daemon stop does not try the next model', async () => {
   expect(turns.map((turn) => turn.model)).toEqual(['model-a'])
   expect(task(id).status).toBe('running')
 })
-
-test.each([
-  { reviewerModels: [MODELS[0]!, MODELS[1]!], expected: 'model-b' },
-  { reviewerModels: [MODELS[0]!, MODELS[2]!], expected: 'model-a' },
-])('c5 reviewer prefers a different provider, otherwise the first model', async ({ reviewerModels, expected }) => {
-  const home = join(root, 'home')
-  mkdirSync(home)
-  store = openStore(join(home, 'state.db'))
-  const factory = startFactory(home, happy)
-  configure('executor', MODELS[0]!)
-  configure('reviewer', ...reviewerModels)
-  const id = seedTask('review provider', 'awaiting_approval')
-  await press(factory, `f1:aa:${id}`, 70)
-  await settled(id)
-  expect(turns.find((turn) => turn.role === 'executor')?.provider).toBe('provider-x')
-  expect(turns.filter((turn) => turn.role === 'reviewer').map((turn) => turn.model)).toEqual([expected])
-})

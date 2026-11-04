@@ -13,6 +13,8 @@
 // `backups/` is never touched. `backups/` is 0700 and every file of a snapshot is
 // 0600. Only the listed paths are copied, never the config directory with the
 // environment file.
+// `DSHBOT_HOME/tools` (programs and caches of the exec sandbox) is not in the list: it is
+// reinstallable and can be large.
 
 import {
   chmodSync,

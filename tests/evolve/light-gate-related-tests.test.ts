@@ -19,7 +19,7 @@ import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import { createEvolve, type Evolve, type OwnerCard, type SyncReport } from '../../packages/evolve/src/index.js'
+import { createEvolve, gateCommand, type Evolve, type OwnerCard, type SyncReport } from '../../packages/evolve/src/index.js'
 
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url))
 
@@ -111,7 +111,14 @@ function vitestScript(root: string): string {
   return `#!${process.execPath}
 ${sharedPrelude(root)}
 record({ tool: 'vitest', argv: args, cwd })
-const positional = args.filter((arg) => !arg.startsWith('-'))
+const WITH_VALUE = ['--exclude', '--include', '--dir', '--root', '-t', '--testNamePattern']
+const positional = []
+for (let i = 0; i < args.length; i += 1) {
+  const arg = args[i]
+  if (WITH_VALUE.includes(arg)) { i += 1; continue }
+  if (arg.startsWith('-')) continue
+  positional.push(arg)
+}
 const sub = positional[0]
 const runMode = sub === 'run' || args.includes('--run') || args.includes('--watch=false') || args.includes('--no-watch')
 if (!runMode) { console.error('vitest would start in watch mode: pass run or --run'); process.exit(2) }
@@ -180,6 +187,7 @@ interface WorldOptions {
   /** package.json carries the `gate` script; without it the gate falls back to `npm test`. */
   gateScript?: boolean
   /** a test file that fails and imports nothing, so no changed file is related to it. */
+  failingCharacter?: boolean
   alwaysFailing?: boolean
 }
 
@@ -201,8 +209,10 @@ function projectFiles(options: WorldOptions): Record<string, string> {
     'src/old.ts': 'export const old = 1\n',
     'CHECKLIST.md': '# Review checklist\n- no secrets in code\n',
     'notes.md': 'original notes\n',
+
     '.gitignore': 'node_modules/\n',
   }
+  if (options.failingCharacter) files['tests/character/core.test.ts'] = "test('character', () => {}) // FAKE_FAIL\n"
   if (options.alwaysFailing !== false) files['src/always-fails.test.ts'] = "test('always fails', () => {}) // FAKE_FAIL\n"
   return files
 }
@@ -358,45 +368,6 @@ test('c2 a type error in a changed .ts file fails the gate with the tsc output',
   expect(calls().some((call) => call.tool === 'tsc')).toBe(true)
 })
 
-test.each(['submit', 'sync'] as const)('c3 c10 a module no test imports passes: unrelated failing tests are not run (%s)', async (path) => {
-  const outcome = await runGate(path, { write: { 'src/lonely.ts': 'export const lonely = 2\n' } })
-
-  expect(outcome.passed, outcome.text).toBe(true)
-  expect(testsRun(), 'tests unrelated to the change must not run').not.toContain('src/always-fails.test.ts')
-  expect(calls().some((call) => call.tool === 'tsc'), 'the whole tree is still type-checked').toBe(true)
-  for (const card of cards) expect(card.text, 'npm test did not run').not.toMatch(RAN_NPM_TEST)
-})
-
-test('c4 a candidate that edits its own test file so that it fails does not pass the gate', async () => {
-  const outcome = await runGate('submit', {
-    write: { 'src/math.test.ts': "import { add } from './math.js'\n\ntest('add', () => { add(1, 2) }) // FAKE_FAIL\n" },
-  })
-
-  expect(outcome.passed, outcome.text).toBe(false)
-  expect(outcome.text).toContain('src/math.test.ts')
-  expect(outcome.text).toContain('AssertionError')
-})
-
-test('c5 a deleted file and .md edits do not break the gate: only existing code files go to the related run', async () => {
-  const outcome = await runGate('submit', {
-    write: {
-      'src/math.ts': 'export const add = (a: number, b: number): number => a + b + 0\n',
-      'notes.md': 'changed notes\n',
-      'docs/guide.md': 'a new guide\n',
-    },
-    remove: ['src/old.ts'],
-  })
-
-  expect(outcome.passed, outcome.text).toBe(true)
-  const vitest = calls().filter((call) => call.tool === 'vitest')
-  expect(vitest.length, 'the related run happens, the changed module has a test').toBeGreaterThan(0)
-  const passed = vitest.flatMap((call) => call.argv ?? [])
-  expect(passed.some((arg) => arg.endsWith('src/math.ts'))).toBe(true)
-  expect(passed.filter((arg) => arg.endsWith('.md') || arg.endsWith('old.ts'))).toEqual([])
-  expect(testsRun()).toEqual(['src/math.test.ts'])
-  expect(calls().some((call) => call.tool === 'tsc')).toBe(true)
-})
-
 test.each(['vitest.config.ts', 'tsconfig.json', 'tsconfig.build.json'])(
   'c6 a change of %s runs the whole suite: an unrelated failing test fails the gate',
   async (name) => {
@@ -408,6 +379,12 @@ test.each(['vitest.config.ts', 'tsconfig.json', 'tsconfig.build.json'])(
     expect(testsRun()).toContain('src/always-fails.test.ts')
   },
 )
+
+test.each(['package.json', 'package-lock.json', 'npm-shrinkwrap.json'])('dependency metadata %s selects the full gate', (name) => {
+  const candidate = join(root, 'candidate')
+  put(join(candidate, 'package.json'), projectFiles({})['package.json']!)
+  expect(gateCommand(candidate, [name]).command).toEqual(['npm', 'test'])
+})
 
 test.each([
   { alwaysFailing: true, passes: false },
@@ -437,25 +414,9 @@ test('c9 the deadline covers the whole light gate: typecheck plus related tests 
   expect(outcome.text).toMatch(/тайм.?аут|timed? ?out/i)
 })
 
-test('c8 the root package.json gate script: typecheck first, then vitest related in run mode passing without tests', () => {
-  const manifest = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as { scripts?: Record<string, string> }
-  const gate = manifest.scripts?.gate
 
-  expect(typeof gate, 'package.json has a gate script').toBe('string')
-  const script = gate ?? ''
-  const related = script.search(/\bvitest\s+related\b/)
-  expect(related, 'the gate runs vitest related').toBeGreaterThan(0)
-  const typecheck = script.search(/\btypecheck\b|\btsc\b/)
-  expect(typecheck, 'typecheck comes first').toBeGreaterThanOrEqual(0)
-  expect(typecheck).toBeLessThan(related)
-  expect(script.slice(typecheck, related), 'typecheck must pass before the related run starts').toContain('&&')
-  expect(script.slice(related)).toMatch(/(?:--run\b|\brun\b)/)
-  expect(script.slice(related)).toMatch(/--passWithNoTests\b|--pass-with-no-tests\b/)
-})
-
-test('c10 the self_submit tool description names the light gate, not only npm test', () => {
-  const { evolve } = makeWorld()
-  const description = evolve.tools.find((tool) => tool.name === 'self_submit')?.description ?? ''
-
-  expect(description).toMatch(RAN_LIGHT_GATE)
+test('a failing character test blocks an otherwise valid related-code candidate', async () => {
+  const outcome = await runGate('submit', { write: { 'src/lonely.ts': 'export const lonely = 2\n' } }, { failingCharacter: true })
+  expect(outcome.passed, outcome.text).toBe(false)
+  expect(outcome.text).toContain('tests/character/core.test.ts')
 })

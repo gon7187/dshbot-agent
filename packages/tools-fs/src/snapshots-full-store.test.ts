@@ -2,6 +2,8 @@
 // snapshot, which may be the very one the owner rolls back to. The rollback must still restore it byte
 // for byte and keep the replaced content as a new snapshot.
 
+import { createFsTools, WRITE_TOOL_NAME } from './index.js'
+
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -76,4 +78,20 @@ test('rolling back the oldest created marker of a full store deletes the file', 
   if (result.status !== 'restored' || result.current === undefined) throw new Error('no undo snapshot')
   expect(rollbackSnapshot(dir, result.current.id).status).toBe('restored')
   expect(readFileSync(target, 'utf8')).toBe('new file of the bot')
+})
+
+
+test('a file write snapshots the exact old bytes before mutation and supports rollback', async () => {
+  const file = join(workspace, 'prewrite.txt')
+  writeFileSync(file, 'old exact bytes\n')
+  const write = createFsTools({ home: scratch, roots: [{ path: workspace }] }).find((tool) => tool.name === WRITE_TOOL_NAME)!
+  await write.execute({ path: file, content: 'new bytes' })
+  const saved = readSnapshots(dir).find((entry) => entry.path === file)
+  expect(saved).toBeDefined()
+  expect(readFileSync(file, 'utf8')).toBe('new bytes')
+  expect(rollbackSnapshot(dir, saved!.id).status).toBe('restored')
+  expect(readFileSync(file, 'utf8')).toBe('old exact bytes\n')
+  fillAfter(readSnapshots(dir).length)
+  snapshotExistingFile(dir, file, 'write')
+  expect(readSnapshots(dir)).toHaveLength(SNAPSHOT_MAX_COUNT)
 })

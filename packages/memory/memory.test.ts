@@ -1,5 +1,4 @@
-import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -43,270 +42,68 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-// Error text as the agent would see it: the message plus any enumerable fields (e.g. entries)
-function errorText(error: unknown): string {
-  if (!(error instanceof Error)) return String(error)
-  return `${error.message} ${JSON.stringify({ ...error })}`
-}
+import { createKnowledgeTool } from './src/knowledge.js'
+import { createUpdateIdentityTool } from './src/tools.js'
 
-function sha256Hex(data: Buffer): string {
-  return createHash('sha256').update(data).digest('hex')
-}
-
-test('test_c1_apply_creates_file_with_separator_and_entries', () => {
-  const file = join(dir, 'MEMORY.md')
-  const store = createEntryStore(file, { limit: 1000 })
-
-  store.apply([
-    { op: 'add', text: 'a' },
-    { op: 'add', text: 'b' },
-  ])
-
-  expect(existsSync(file)).toBe(true)
-  expect(readFileSync(file, 'utf8').trim().split('\n§\n')).toEqual(['a', 'b'])
-  expect(store.entries()).toEqual(['a', 'b'])
-})
-
-test('test_c2_oversized_batch_is_rejected_file_unchanged_error_lists_entries', () => {
+test('M-ATOMIC rejected batches stale revisions and interrupted writes preserve prior bytes', () => {
   const file = join(dir, 'MEMORY.md')
   const store = createEntryStore(file, { limit: 30 })
   store.apply([{ op: 'add', text: 'alpha' }])
   const before = readFileSync(file)
-
-  let thrown: unknown
-  try {
-    store.apply([{ op: 'add', text: 'x'.repeat(40) }])
-  } catch (error) {
-    thrown = error
+  for (const edits of [
+    [{ op: 'add' as const, text: 'x'.repeat(40) }],
+    [{ op: 'add' as const, text: 'beta' }, { op: 'remove' as const, match: 'missing' }],
+  ]) {
+    expect(() => store.apply(edits)).toThrow()
+    expect(readFileSync(file)).toEqual(before)
   }
-
-  expect(thrown).toBeInstanceOf(Error)
-  expect(errorText(thrown)).toContain('alpha')
-  expect(readFileSync(file).equals(before)).toBe(true)
-})
-
-test('test_c3_remove_plus_add_fits_limit_even_though_add_alone_would_not', () => {
-  const file = join(dir, 'MEMORY.md')
-  const store = createEntryStore(file, { limit: 40 })
-  store.apply([{ op: 'add', text: 'O'.repeat(30) }])
-
-  store.apply([
-    { op: 'remove', match: 'OOOO' },
-    { op: 'add', text: 'N'.repeat(30) },
-  ])
-
-  expect(store.entries()).toEqual(['N'.repeat(30)])
-})
-
-test('test_c4_remove_with_zero_matches_rejects_whole_batch', () => {
-  const file = join(dir, 'MEMORY.md')
-  const store = createEntryStore(file, { limit: 1000 })
-  store.apply([
-    { op: 'add', text: 'alpha' },
-    { op: 'add', text: 'beta' },
-  ])
-  const before = readFileSync(file)
-
-  expect(() =>
-    store.apply([
-      { op: 'add', text: 'gamma' },
-      { op: 'remove', match: 'zzz' },
-    ]),
-  ).toThrow()
-
-  expect(readFileSync(file).equals(before)).toBe(true)
-  expect(store.entries()).toEqual(['alpha', 'beta'])
-})
-
-test('test_c4_replace_with_several_matches_rejects_whole_batch', () => {
-  const file = join(dir, 'MEMORY.md')
-  const store = createEntryStore(file, { limit: 1000 })
-  store.apply([
-    { op: 'add', text: 'alpha one' },
-    { op: 'add', text: 'alpha two' },
-  ])
-  const before = readFileSync(file)
-
-  expect(() =>
-    store.apply([
-      { op: 'add', text: 'gamma' },
-      { op: 'replace', match: 'alpha', text: 'x' },
-    ]),
-  ).toThrow()
-
-  expect(readFileSync(file).equals(before)).toBe(true)
-  expect(store.entries()).toEqual(['alpha one', 'alpha two'])
-})
-
-test('test_c5_adding_identical_text_again_does_not_duplicate', () => {
-  const file = join(dir, 'MEMORY.md')
-  const store = createEntryStore(file, { limit: 1000 })
-
-  store.apply([{ op: 'add', text: 'alpha' }])
-  store.apply([{ op: 'add', text: 'alpha' }])
-
-  expect(store.entries()).toEqual(['alpha'])
-})
-
-test('test_c6_read_identity_returns_text_and_sha256_revision', () => {
-  const file = join(dir, 'identity.md')
-  const content = 'Я — личность.\nВторая строка.'
-  writeFileSync(file, content)
-
-  const identity = readIdentity(file)
-
-  expect(identity.text).toBe(content)
-  expect(identity.revision).toBe(sha256Hex(Buffer.from(content, 'utf8')))
-})
-
-test('test_c7_write_identity_with_current_revision_writes_text', () => {
-  const file = join(dir, 'identity.md')
-  writeFileSync(file, 'версия один')
-  const { revision } = readIdentity(file)
-
-  writeIdentity(file, 'версия два', revision)
-
-  expect(readIdentity(file).text).toBe('версия два')
-})
-
-test('test_c7_write_identity_with_stale_revision_throws_and_keeps_file', () => {
-  const file = join(dir, 'identity.md')
-  writeFileSync(file, 'версия один')
-  const stale = readIdentity(file).revision
-  writeIdentity(file, 'версия два', stale)
-  const before = readFileSync(file)
-
-  expect(() => writeIdentity(file, 'версия три', stale)).toThrow()
-
-  expect(readFileSync(file).equals(before)).toBe(true)
-  expect(readIdentity(file).text).toBe('версия два')
-})
-
-test('test_c8_write_identity_rejects_empty_or_blank_text_and_keeps_file', () => {
-  const file = join(dir, 'identity.md')
-  writeFileSync(file, 'личность')
-  const { revision } = readIdentity(file)
-  const before = readFileSync(file)
-
-  expect(() => writeIdentity(file, '', revision)).toThrow()
-  expect(() => writeIdentity(file, ' \n\t ', revision)).toThrow()
-
-  expect(readFileSync(file).equals(before)).toBe(true)
-})
-
-test('test_c9_search_finds_document_with_fields_and_snippet', () => {
-  const index = createRecallIndex(db)
-  index.index({ id: 'chat-1', source: 'telegram', kind: 'chat', text: 'Владелец спросил про погоду в Казани', ts: 1700000000000 })
-
-  const hits = index.search('погоду', { limit: 10 })
-
-  expect(hits).toHaveLength(1)
-  expect(hits[0]).toMatchObject({ id: 'chat-1', source: 'telegram', kind: 'chat', ts: 1700000000000 })
-  expect(JSON.stringify(hits[0])).toContain('погоду')
-})
-
-test('test_c10_reindex_with_same_id_replaces_document', () => {
-  const index = createRecallIndex(db)
-  index.index({ id: 'doc-1', source: 'journal', kind: 'journal', text: 'старый текст про кошку', ts: 1 })
-  index.index({ id: 'doc-1', source: 'journal', kind: 'journal', text: 'новый текст про собаку', ts: 2 })
-
-  expect(index.search('кошку', { limit: 10 }).map((hit) => hit.id)).not.toContain('doc-1')
-  expect(index.search('собаку', { limit: 10 }).map((hit) => hit.id)).toContain('doc-1')
-})
-
-test('test_c11_schedule_ranks_below_journal_for_equal_text', () => {
-  const index = createRecallIndex(db)
-  // schedule is indexed first so insertion order does not explain the expected ranking
-  index.index({ id: 'sched-1', source: 'cron', kind: 'schedule', text: 'проверить сервер утром', ts: 1 })
-  index.index({ id: 'journal-1', source: 'owner', kind: 'journal', text: 'проверить сервер утром', ts: 1 })
-
-  const ids = index.search('сервер', { limit: 10 }).map((hit) => hit.id)
-
-  expect(ids).toContain('journal-1')
-  expect(ids).toContain('sched-1')
-  expect(ids.indexOf('journal-1')).toBeLessThan(ids.indexOf('sched-1'))
-})
-
-test('test_c12_search_with_fts_special_characters_does_not_throw', () => {
-  const index = createRecallIndex(db)
-  index.index({ id: 'doc-1', source: 'telegram', kind: 'chat', text: 'кто-то написал "привет" в чат', ts: 1 })
-
-  for (const query of ['"привет', 'при*', 'time:12', 'кто-то', 'NEAR(', '"', '-', '*', ':', 'a"b*c:d-e']) {
-    expect(() => index.search(query, { limit: 5 })).not.toThrow()
-  }
-})
-
-test('test_c13_search_respects_limit', () => {
-  const index = createRecallIndex(db)
-  index.index({ id: 'doc-1', source: 'journal', kind: 'journal', text: 'отчёт один', ts: 1 })
-  index.index({ id: 'doc-2', source: 'journal', kind: 'journal', text: 'отчёт два', ts: 2 })
-  index.index({ id: 'doc-3', source: 'journal', kind: 'journal', text: 'отчёт три', ts: 3 })
-
-  expect(index.search('отчёт', { limit: 2 })).toHaveLength(2)
-})
-
-test('test_c1_atomic_identity_write_replaces_file_inode_and_leaves_no_temp_file', () => {
-  const file = join(dir, 'identity.md')
-  writeFileSync(file, 'версия один')
-  const { revision } = readIdentity(file)
-  const inodeBefore = statSync(file).ino
-
-  writeIdentity(file, 'версия два', revision)
-
-  expect(statSync(file).ino).not.toBe(inodeBefore)
-  expect(readFileSync(file, 'utf8')).toBe('версия два')
-  expect(readdirSync(dir)).toEqual(['identity.md'])
-})
-
-test('test_c2_atomic_apply_replaces_memory_file_inode_and_leaves_no_temp_file', () => {
-  const file = join(dir, 'MEMORY.md')
-  const store = createEntryStore(file, { limit: 1000 })
-  store.apply([{ op: 'add', text: 'alpha' }])
-  const inodeBefore = statSync(file).ino
-
-  store.apply([{ op: 'add', text: 'beta' }])
-
-  expect(statSync(file).ino).not.toBe(inodeBefore)
-  expect(readFileSync(file, 'utf8').split('\n§\n')).toEqual(['alpha', 'beta'])
-  expect(store.entries()).toEqual(['alpha', 'beta'])
-  expect(readdirSync(dir)).toEqual(['MEMORY.md'])
-})
-
-test('test_c3_atomic_identity_write_failure_rethrows_keeps_bytes_and_leaves_no_temp_file', () => {
-  const file = join(dir, 'identity.md')
-  writeFileSync(file, 'личность до сбоя')
-  const { revision } = readIdentity(file)
-  const before = readFileSync(file)
-
+  const identity = join(dir, 'identity.md')
+  writeFileSync(identity, 'original identity')
+  const { revision } = readIdentity(identity)
+  writeIdentity(identity, 'new identity', revision)
+  expect(() => writeIdentity(identity, 'stale replacement', revision)).toThrow()
+  const identityBefore = readFileSync(identity)
   fault.failWrites = true
   try {
-    expect(() => writeIdentity(file, 'личность после сбоя', revision)).toThrow(/simulated write failure/)
-  } finally {
-    fault.failWrites = false
-  }
-
-  expect(readFileSync(file).equals(before)).toBe(true)
-  expect(readdirSync(dir)).toEqual(['identity.md'])
+    expect(() => store.apply([{ op: 'add', text: 'beta' }])).toThrow('simulated write failure')
+    expect(() => writeIdentity(identity, 'partial identity', readIdentity(identity).revision)).toThrow('simulated write failure')
+  } finally { fault.failWrites = false }
+  expect(readFileSync(file)).toEqual(before)
+  expect(readFileSync(identity)).toEqual(identityBefore)
+  expect(readdirSync(dir).sort()).toEqual(['MEMORY.md', 'identity.md'])
 })
 
-test('test_c4_atomic_apply_write_failure_rethrows_keeps_bytes_and_leaves_no_temp_file', () => {
-  const file = join(dir, 'MEMORY.md')
-  const store = createEntryStore(file, { limit: 1000 })
-  store.apply([{ op: 'add', text: 'alpha' }])
-  const before = readFileSync(file)
-
-  fault.failWrites = true
-  try {
-    expect(() => store.apply([{ op: 'add', text: 'beta' }])).toThrow(/simulated write failure/)
-  } finally {
-    fault.failWrites = false
-  }
-
-  expect(readFileSync(file).equals(before)).toBe(true)
-  expect(readdirSync(dir)).toEqual(['MEMORY.md'])
+test('M-RESTORE archives forced identity edits and restores knowledge without losing versions', async () => {
+  const identity = join(dir, 'identity.md')
+  const original = 'original identity '.repeat(50)
+  writeFileSync(identity, original)
+  const update = createUpdateIdentityTool(identity)
+  const args = { text: 'replacement', expected_revision: readIdentity(identity).revision, force: true }
+  await expect(async () => update.execute(args)).rejects.toThrow()
+  expect(readFileSync(identity, 'utf8')).toBe(original)
+  await update.execute({ ...args, reason: 'remove duplicate history' })
+  const archive = join(dir, 'identity-archive')
+  const archived = readdirSync(archive)
+  expect(archived).toHaveLength(1)
+  expect(readFileSync(join(archive, archived[0]!), 'utf8')).toContain(original)
+  expect(readFileSync(identity, 'utf8')).toBe('replacement')
+  const tool = createKnowledgeTool(join(dir, 'knowledge'), { timeZone: 'UTC' })
+  await tool.execute({ action: 'write', topic: 'threshold', summary: 'first', text: 'first content' })
+  await tool.execute({ action: 'write', topic: 'threshold', summary: 'second', text: 'second content' })
+  const history = String(await tool.execute({ action: 'history', topic: 'threshold' }))
+  const selected = history.split('\n').find(line => line.includes('first')) ?? ''
+  const version = selected.match(/\bthreshold-\d{4}-\d{2}-\d{2}[^\s,;|]*\.md\b/)?.[0]
+    ?? selected.match(/^\s*(?:[-*]\s*)?(\d+)\s*[.):|—-]/)?.[1]
+  expect(version, history).toBeDefined()
+  const reopened = createKnowledgeTool(join(dir, 'knowledge'))
+  await reopened.execute({ action: 'restore', topic: 'threshold', version })
+  expect(String(await reopened.execute({ action: 'read', topic: 'threshold' }))).toContain('first content')
+  const after = String(await reopened.execute({ action: 'history', topic: 'threshold' }))
+  expect(after).toContain('first')
+  expect(after).toContain('second')
 })
 
-test('test_c5_the_relay_uses_the_top_level_system_marker_and_needs_the_whole_turn', async () => {
+test('M-RECALL-BOUNDARY only the exact owner turn receives private recall', async () => {
   const received: string[] = []
   const upstream = createServer((req, res) => {
     const chunks: Buffer[] = []

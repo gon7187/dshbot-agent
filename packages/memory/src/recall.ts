@@ -1,7 +1,8 @@
 // Recall index on the built-in SQLite FTS5.
 //
-// Queries are rebuilt from plain word characters before reaching MATCH, so
-// arbitrary user/agent text (quotes, `*`, `:`, `-`, `NEAR(`) can never be
+// Queries are rebuilt from plain word characters before reaching MATCH (words
+// longer than 4 letters also match their other forms, see queryTerms in
+// packages/store/src/session-index.ts), so arbitrary user/agent text (quotes, `*`, `:`, `-`, `NEAR(`) can never be
 // interpreted as FTS5 syntax. Schedule documents are demoted because repeated
 // cron vocabulary would otherwise crowd out journal and chat memories.
 // Workspace files are indexed by the workspace indexer (./workspace.ts); their
@@ -9,6 +10,8 @@
 
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+
+import { queryTerms, toMatchQuery, type QueryTerm } from '../../store/src/session-index.js'
 
 export const RECALL_KINDS = ['chat', 'journal', 'knowledge', 'schedule', 'workspace'] as const
 
@@ -61,23 +64,22 @@ const SCHEDULE_WEIGHT = 0.35
  */
 const RECENCY_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000
 
-function words(query: string): string[] {
-  const tokens = query.match(/[\p{L}\p{N}_]+/gu) ?? []
-  return [...new Set(tokens.map((token) => token.toLowerCase()))]
-}
-
 /** Lowercase and strip diacritics, so a folded FTS match counts as the query word. */
 function foldWord(value: string): string {
   return value.normalize('NFD').replace(/\p{M}+/gu, '').toLowerCase()
 }
 
 /**
- * Distinct query words that FTS5 marked in the document. `marked` is the text
- * returned by `highlight()` with the per-search markers around every matched
- * phrase.
+ * Distinct query words that FTS5 marked in the document, another form of a
+ * long word counting as that word. `marked` is the text returned by
+ * `highlight()` with the per-search markers around every matched phrase.
  */
-function matchedWordCount(marked: string, open: string, close: string, query: string[]): number {
-  const wanted = new Set(query.map(foldWord))
+function matchedWordCount(marked: string, open: string, close: string, terms: readonly QueryTerm[]): number {
+  const wanted = terms.map(({ word, stem }) => ({
+    key: foldWord(stem ?? word),
+    whole: foldWord(word),
+    prefix: stem !== null,
+  }))
   const found = new Set<string>()
   let at = marked.indexOf(open)
   while (at >= 0) {
@@ -86,19 +88,13 @@ function matchedWordCount(marked: string, open: string, close: string, query: st
     if (to < 0) break
     for (const token of marked.slice(from, to).match(/[\p{L}\p{N}_]+/gu) ?? []) {
       const folded = foldWord(token)
-      if (wanted.has(folded)) found.add(folded)
+      for (const term of wanted) {
+        if (term.prefix ? folded.startsWith(term.key) : folded === term.whole) found.add(term.key)
+      }
     }
     at = marked.indexOf(open, to + close.length)
   }
   return found.size
-}
-
-
-/** FTS5 query made only of quoted terms; an empty query matches nothing. */
-function toMatchQuery(query: string): string | null {
-  const tokens = words(query).slice(0, 64)
-  if (tokens.length === 0) return null
-  return tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(' OR ')
 }
 
 /**
@@ -175,9 +171,9 @@ export function createRecallIndex(db: DatabaseSync): RecallIndex {
     if (!Number.isFinite(requested) || requested <= 0) return []
     const limit = Math.floor(requested)
 
-    const match = toMatchQuery(query)
+    const terms = queryTerms(query)
+    const match = toMatchQuery(terms)
     if (match === null) return []
-    const queryWords = words(query).slice(0, 64)
     // Per-search markers cannot collide with text already in a document.
     const nonce = randomUUID()
     const open = `\u0001${nonce}<`
@@ -198,7 +194,7 @@ export function createRecallIndex(db: DatabaseSync): RecallIndex {
         kind: row.kind as RecallKind,
         ts: Number(row.ts),
         snippet: String(row.snippet ?? ''),
-        matched: matchedWordCount(String(row.body ?? ''), open, close, queryWords),
+        matched: matchedWordCount(String(row.body ?? ''), open, close, terms),
       }
       if (hit.kind === 'workspace') {
         hit.lines = matchedLines(String(row.body ?? ''), open, close)
